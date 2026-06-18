@@ -303,6 +303,24 @@ def _anthropic_content_to_openai(
             text_val = block.get("text", "")
             text_parts.append(text_val)
             openai_content_parts.append({"type": "text", "text": text_val})
+        elif btype == "document":
+            source = block.get("source", {})
+            src_type = source.get("type", "")
+            if src_type == "text":
+                doc_text = source.get("text", "")
+                text_parts.append(doc_text)
+                openai_content_parts.append({"type": "text", "text": doc_text})
+            elif src_type == "url":
+                doc_text = f"[Attached document: {source.get('url', 'unknown')}]"
+                text_parts.append(doc_text)
+                openai_content_parts.append({"type": "text", "text": doc_text})
+            else:
+                # base64 or unsupported — emit a placeholder (IBM ICA doesn't support native docs)
+                media_type = source.get("media_type", "application/octet-stream")
+                title = block.get("title") or media_type
+                doc_text = f"[Attached document: {title}]"
+                text_parts.append(doc_text)
+                openai_content_parts.append({"type": "text", "text": doc_text})
         elif btype == "tool_use":
             tool_calls.append({
                 "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
@@ -442,6 +460,17 @@ def anthropic_to_openai_request(
                 btype = block.get("type")
                 if btype == "text":
                     parts.append(block.get("text", ""))
+                elif btype == "document":
+                    source = block.get("source", {})
+                    src_type = source.get("type", "")
+                    if src_type == "text":
+                        parts.append(source.get("text", ""))
+                    elif src_type == "url":
+                        parts.append(f"[Attached document: {source.get('url', 'unknown')}]")
+                    else:
+                        media_type = source.get("media_type", "application/octet-stream")
+                        title = block.get("title") or media_type
+                        parts.append(f"[Attached document: {title}]")
                 elif btype == "tool_use":
                     parts.append(_tool_use_block_to_xml(block))
                 elif btype == "tool_result":

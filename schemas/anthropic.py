@@ -32,11 +32,22 @@ class ContentBlockToolResult(BaseModel):
     is_error: Optional[bool] = None
 
 
+class ContentBlockDocument(BaseModel):
+    type: Literal["document"] = "document"
+    source: dict[str, Any]
+    title: Optional[str] = None
+    context: Optional[str] = None
+    citations: Optional[dict[str, Any]] = None
+    # Allow extra fields for forward compatibility
+    model_config = {"extra": "allow"}
+
+
 ContentBlock = Union[
     ContentBlockText,
     ContentBlockImage,
     ContentBlockToolUse,
     ContentBlockToolResult,
+    ContentBlockDocument,
 ]
 
 
