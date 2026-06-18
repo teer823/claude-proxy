@@ -13,25 +13,96 @@ logger = logging.getLogger(__name__)
 _DATA_PREFIX = chr(100) + chr(97) + chr(116) + chr(97) + chr(58)  # d-a-t-a-:
 
 
+def _log_upstream_error(url: str, status_code: int, body: str) -> None:
+    """Log a structured error message for a non-200 upstream response.
+
+    Attempts to extract a machine-readable error code and description from the
+    response body when it is JSON (e.g. OpenAI-style ``{"error": {"code": ...,
+    "message": ...}}`` or a top-level ``{"message": ...}``).  Falls back to a
+    plain body preview when the body is not valid JSON.
+    """
+    error_code: str | None = None
+    error_message: str | None = None
+    error_type: str | None = None
+
+    try:
+        data = json.loads(body)
+        # OpenAI-style: {"error": {"code": ..., "message": ..., "type": ...}}
+        if isinstance(data, dict):
+            err = data.get("error") or {}
+            if isinstance(err, dict):
+                error_code = err.get("code") or err.get("status")
+                error_message = err.get("message")
+                error_type = err.get("type")
+            # Flat style: {"message": ..., "code": ...}
+            if error_message is None:
+                error_message = data.get("message") or data.get("detail")
+            if error_code is None:
+                error_code = data.get("code") or data.get("status")
+    except (json.JSONDecodeError, ValueError):
+        pass  # body is not JSON; will log raw preview below
+
+    if error_message or error_code:
+        logger.error(
+            "Upstream returned HTTP %s | url=%s | error_code=%s | error_type=%s | error_message=%s",
+            status_code,
+            url,
+            error_code,
+            error_type,
+            error_message,
+        )
+    else:
+        logger.error(
+            "Upstream returned HTTP %s | url=%s | body_preview=%s",
+            status_code,
+            url,
+            body[:500],
+        )
+
+
 async def forward_request(
     url: str,
     headers: dict[str, str],
     payload: dict[str, Any],
+    read_timeout: float = 300.0,
 ) -> dict[str, Any]:
-    """Send a non-streaming POST request and return the parsed JSON response."""
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    """Send a non-streaming POST request and return the parsed JSON response.
+
+    ``read_timeout`` controls how long (in seconds) to wait for the upstream to
+    start or continue sending a response.  Connect and write timeouts are kept
+    shorter since those phases are not affected by response-generation time.
+    """
+    timeout = httpx.Timeout(connect=10.0, write=60.0, read=read_timeout, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             response = await client.post(url, headers=headers, json=payload)
+        except httpx.TimeoutException as exc:
+            logger.error(
+                "Request to upstream timed out | url=%s | error_type=%s | detail=%s",
+                url,
+                type(exc).__name__,
+                exc,
+            )
+            raise HTTPException(status_code=504, detail=f"Upstream request timed out: {exc}")
+        except httpx.ConnectError as exc:
+            logger.error(
+                "Failed to connect to upstream | url=%s | error_type=%s | detail=%s",
+                url,
+                type(exc).__name__,
+                exc,
+            )
+            raise HTTPException(status_code=502, detail=f"Upstream connection failed: {exc}")
         except httpx.RequestError as exc:
-            logger.error("Request to upstream failed: %s", exc)
+            logger.error(
+                "Request to upstream failed | url=%s | error_type=%s | detail=%s",
+                url,
+                type(exc).__name__,
+                exc,
+            )
             raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}")
 
         if response.status_code != 200:
-            logger.error(
-                "Upstream returned %s: %s",
-                response.status_code,
-                response.text[:500],
-            )
+            _log_upstream_error(url, response.status_code, response.text)
             raise HTTPException(
                 status_code=response.status_code,
                 detail=f"Upstream error: {response.text[:500]}",
@@ -40,7 +111,13 @@ async def forward_request(
         try:
             return response.json()
         except Exception as exc:
-            logger.error("Failed to parse upstream JSON: %s", exc)
+            logger.error(
+                "Failed to parse upstream JSON | url=%s | error_type=%s | detail=%s | body_preview=%s",
+                url,
+                type(exc).__name__,
+                exc,
+                response.text[:200],
+            )
             raise HTTPException(status_code=502, detail="Upstream returned invalid JSON")
 
 
@@ -48,24 +125,26 @@ async def stream_request(
     url: str,
     headers: dict[str, str],
     payload: dict[str, Any],
+    read_timeout: float = 300.0,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     Send a streaming POST request and yield parsed OpenAI SSE chunks as dicts.
     Skips [DONE] and malformed lines.
+
+    ``read_timeout`` controls how long (in seconds) to wait between received
+    bytes from the upstream SSE stream.
     """
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    timeout = httpx.Timeout(connect=10.0, write=60.0, read=read_timeout, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             async with client.stream("POST", url, headers=headers, json=payload) as response:
                 if response.status_code != 200:
                     body = await response.aread()
-                    logger.error(
-                        "Upstream stream returned %s: %s",
-                        response.status_code,
-                        body[:500],
-                    )
+                    body_text = body.decode(errors="replace")
+                    _log_upstream_error(url, response.status_code, body_text)
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail=f"Upstream error: {body.decode(errors='replace')[:500]}",
+                        detail=f"Upstream error: {body_text[:500]}",
                     )
 
                 async for line in response.aiter_lines():
@@ -84,6 +163,27 @@ async def stream_request(
                     except json.JSONDecodeError:
                         logger.warning("Skipping unparseable SSE line: %s", data[:200])
                         continue
+        except httpx.TimeoutException as exc:
+            logger.error(
+                "Streaming request to upstream timed out | url=%s | error_type=%s | detail=%s",
+                url,
+                type(exc).__name__,
+                exc,
+            )
+            raise HTTPException(status_code=504, detail=f"Upstream stream timed out: {exc}")
+        except httpx.ConnectError as exc:
+            logger.error(
+                "Failed to connect to upstream (stream) | url=%s | error_type=%s | detail=%s",
+                url,
+                type(exc).__name__,
+                exc,
+            )
+            raise HTTPException(status_code=502, detail=f"Upstream connection failed: {exc}")
         except httpx.RequestError as exc:
-            logger.error("Streaming request to upstream failed: %s", exc)
+            logger.error(
+                "Streaming request to upstream failed | url=%s | error_type=%s | detail=%s",
+                url,
+                type(exc).__name__,
+                exc,
+            )
             raise HTTPException(status_code=502, detail=f"Upstream stream failed: {exc}")

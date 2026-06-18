@@ -103,6 +103,7 @@ async def _stream_anthropic_events(
     headers: dict[str, str],
     payload: dict[str, Any],
     original_model: str,
+    read_timeout: float = 300.0,
 ) -> AsyncIterator[str]:
     """Translate OpenAI SSE stream into Anthropic SSE events."""
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -115,7 +116,7 @@ async def _stream_anthropic_events(
 
     yield _sse_event("ping", {"type": "ping"})
 
-    async for chunk in stream_request(upstream_url, headers, payload):
+    async for chunk in stream_request(upstream_url, headers, payload, read_timeout=read_timeout):
         events, block_index, sent_message_start, sent_content_block_start, accumulated_text, usage_data = (
             openai_stream_to_anthropic_events(
                 chunk=chunk,
@@ -220,6 +221,7 @@ async def _run_web_search_agentic_loop(
     headers: dict[str, str],
     provider: str,
     tavily_api_key: str,
+    read_timeout: float = 300.0,
 ) -> dict[str, Any]:
     """Execute the agentic tool-call loop for web_search.
 
@@ -260,7 +262,7 @@ async def _run_web_search_agentic_loop(
         # Always non-streaming inside the loop so we can inspect tool calls
         payload["stream"] = False
 
-        oai_response = await forward_request(upstream_url, headers, payload)
+        oai_response = await forward_request(upstream_url, headers, payload, read_timeout=read_timeout)
         anthropic_response = openai_to_anthropic_response(oai_response, current_request)
 
         # Check if the model wants to call web_search
@@ -420,6 +422,7 @@ async def create_message(
             headers=headers,
             provider=settings.web_search_provider,
             tavily_api_key=settings.tavily_api_key,
+            read_timeout=settings.upstream_read_timeout,
         )
         if request.stream:
             return StreamingResponse(
@@ -439,7 +442,7 @@ async def create_message(
 
     if request.stream:
         return StreamingResponse(
-            _stream_anthropic_events(upstream_url, headers, payload, request.model),
+            _stream_anthropic_events(upstream_url, headers, payload, request.model, read_timeout=settings.upstream_read_timeout),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -448,6 +451,6 @@ async def create_message(
             },
         )
 
-    oai_response = await forward_request(upstream_url, headers, payload)
+    oai_response = await forward_request(upstream_url, headers, payload, read_timeout=settings.upstream_read_timeout)
     anthropic_response = openai_to_anthropic_response(oai_response, request)
     return JSONResponse(content=anthropic_response)

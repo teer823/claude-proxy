@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     # Web search tool settings
     web_search_provider: str = "duckduckgo"  # "duckduckgo" or "tavily"
     tavily_api_key: str = ""
+    # Timeout settings
+    upstream_read_timeout: float = 300.0  # seconds to wait for upstream to respond/stream
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
