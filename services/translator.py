@@ -427,6 +427,20 @@ def anthropic_to_openai_request(
     if xml_mode and request.tools:
         tool_hint = _tools_to_system_prompt(request.tools)
         system_text = (tool_hint + "\n\n" + system_text).strip()
+    # Inject agentic tool-use reminder when tools are present (non-XML mode).
+    # IBM ICA sometimes responds with plain text instead of calling a tool for
+    # simple action requests (e.g. "open finder"). This reminder nudges the model
+    # to prefer tool calls over text descriptions.
+    if not xml_mode and request.tools:
+        tool_names = [t.name for t in request.tools]
+        reminder = (
+            "IMPORTANT: You have access to tools listed above. When the user asks you "
+            "to perform any action (run a command, read/write a file, open an application, "
+            "search the web, etc.), you MUST call the appropriate tool rather than "
+            "describing the action in plain text or a code block. "
+            f"Available tools include: {', '.join(tool_names)}."
+        )
+        system_text = (system_text + "\n\n" + reminder).strip()
     if system_text:
         openai_messages: list[ChatMessage] = [ChatMessage(role="system", content=system_text)]
     else:
