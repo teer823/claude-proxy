@@ -32,6 +32,11 @@ def _get_settings():
     return settings
 
 
+def _get_request_id(http_request: Request) -> str | None:
+    """Return the debug request_id stored on request.state by the middleware, or None."""
+    return getattr(http_request.state, "debug_request_id", None)
+
+
 def _build_upstream_headers(api_key: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
@@ -104,6 +109,7 @@ async def _stream_anthropic_events(
     payload: dict[str, Any],
     original_model: str,
     read_timeout: float = 300.0,
+    request_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Translate OpenAI SSE stream into Anthropic SSE events."""
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -116,7 +122,7 @@ async def _stream_anthropic_events(
 
     yield _sse_event("ping", {"type": "ping"})
 
-    async for chunk in stream_request(upstream_url, headers, payload, read_timeout=read_timeout):
+    async for chunk in stream_request(upstream_url, headers, payload, read_timeout=read_timeout, request_id=request_id):
         events, block_index, sent_message_start, sent_content_block_start, accumulated_text, usage_data = (
             openai_stream_to_anthropic_events(
                 chunk=chunk,
@@ -222,6 +228,7 @@ async def _run_web_search_agentic_loop(
     provider: str,
     tavily_api_key: str,
     read_timeout: float = 300.0,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute the agentic tool-call loop for web_search.
 
@@ -262,7 +269,7 @@ async def _run_web_search_agentic_loop(
         # Always non-streaming inside the loop so we can inspect tool calls
         payload["stream"] = False
 
-        oai_response = await forward_request(upstream_url, headers, payload, read_timeout=read_timeout)
+        oai_response = await forward_request(upstream_url, headers, payload, read_timeout=read_timeout, request_id=request_id)
         anthropic_response = openai_to_anthropic_response(oai_response, current_request)
 
         # Check if the model wants to call web_search
@@ -423,6 +430,7 @@ async def create_message(
             provider=settings.web_search_provider,
             tavily_api_key=settings.tavily_api_key,
             read_timeout=settings.upstream_read_timeout,
+            request_id=_get_request_id(http_request),
         )
         if request.stream:
             return StreamingResponse(
@@ -440,9 +448,11 @@ async def create_message(
     openai_request = anthropic_to_openai_request(request, target_model)
     payload = openai_request.model_dump(exclude_none=True)
 
+    rid = _get_request_id(http_request)
+
     if request.stream:
         return StreamingResponse(
-            _stream_anthropic_events(upstream_url, headers, payload, request.model, read_timeout=settings.upstream_read_timeout),
+            _stream_anthropic_events(upstream_url, headers, payload, request.model, read_timeout=settings.upstream_read_timeout, request_id=rid),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -451,6 +461,6 @@ async def create_message(
             },
         )
 
-    oai_response = await forward_request(upstream_url, headers, payload, read_timeout=settings.upstream_read_timeout)
+    oai_response = await forward_request(upstream_url, headers, payload, read_timeout=settings.upstream_read_timeout, request_id=rid)
     anthropic_response = openai_to_anthropic_response(oai_response, request)
     return JSONResponse(content=anthropic_response)

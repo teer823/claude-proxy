@@ -18,6 +18,11 @@ COPY services/ services/
 # Switch to non-root user
 USER appuser
 
+# Explicitly disable debug mode in the container image.
+# Override at runtime with -e DEBUG_MODE=true or via --env-file if needed.
+ENV DEBUG_MODE=false
+ENV DEBUG_LOG_DIR=logs
+
 EXPOSE 8082
 
 CMD ["python", "main.py"]

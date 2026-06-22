@@ -23,6 +23,9 @@ if [ -f ".env" ]; then
 fi
 
 echo "Starting Claude Code Proxy (debug) on port 8082..."
+export DEBUG_MODE=true
+export DEBUG_LOG_DIR="${DEBUG_LOG_DIR:-logs}"
+
 exec .venv/bin/uvicorn main:app \
   --host 0.0.0.0 \
   --port 8082 \

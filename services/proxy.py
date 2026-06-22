@@ -9,6 +9,15 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
+
+def _get_debug_log():
+    """Return the debug logger if debug mode is active, else None."""
+    try:
+        from services.debug_logger import get_debug_logger
+        return get_debug_logger()
+    except Exception:
+        return None
+
 # "" — built via chr() to survive markdown rendering
 _DATA_PREFIX = chr(100) + chr(97) + chr(116) + chr(97) + chr(58)  # d-a-t-a-:
 
@@ -65,13 +74,20 @@ async def forward_request(
     headers: dict[str, str],
     payload: dict[str, Any],
     read_timeout: float = 300.0,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Send a non-streaming POST request and return the parsed JSON response.
 
     ``read_timeout`` controls how long (in seconds) to wait for the upstream to
     start or continue sending a response.  Connect and write timeouts are kept
     shorter since those phases are not affected by response-generation time.
+    ``request_id`` is threaded through from the middleware for log correlation.
     """
+    debug_log = _get_debug_log()
+    if debug_log and request_id:
+        from services.debug_logger import log_upstream_request
+        log_upstream_request(debug_log, request_id, url, headers, payload)
+
     timeout = httpx.Timeout(connect=10.0, write=60.0, read=read_timeout, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -109,7 +125,7 @@ async def forward_request(
             )
 
         try:
-            return response.json()
+            data = response.json()
         except Exception as exc:
             logger.error(
                 "Failed to parse upstream JSON | url=%s | error_type=%s | detail=%s | body_preview=%s",
@@ -120,12 +136,19 @@ async def forward_request(
             )
             raise HTTPException(status_code=502, detail="Upstream returned invalid JSON")
 
+        if debug_log and request_id:
+            from services.debug_logger import log_upstream_response
+            log_upstream_response(debug_log, request_id, response.status_code, data, is_streaming=False)
+
+        return data
+
 
 async def stream_request(
     url: str,
     headers: dict[str, str],
     payload: dict[str, Any],
     read_timeout: float = 300.0,
+    request_id: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     Send a streaming POST request and yield parsed OpenAI SSE chunks as dicts.
@@ -133,8 +156,16 @@ async def stream_request(
 
     ``read_timeout`` controls how long (in seconds) to wait between received
     bytes from the upstream SSE stream.
+    ``request_id`` is threaded through from the middleware for log correlation.
     """
+    debug_log = _get_debug_log()
+    if debug_log and request_id:
+        from services.debug_logger import log_upstream_request
+        log_upstream_request(debug_log, request_id, url, headers, payload)
+
     timeout = httpx.Timeout(connect=10.0, write=60.0, read=read_timeout, pool=5.0)
+    chunks_for_log: list[dict[str, Any]] = []
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             async with client.stream("POST", url, headers=headers, json=payload) as response:
@@ -153,16 +184,20 @@ async def stream_request(
                         continue
                     if not line.startswith(_DATA_PREFIX):
                         continue
-                    # Strip "" prefix; .strip() handles optional trailing space
+                    # Strip "" prefix; .strip() handles optional trailing space.
                     # IBM ICA sends "{...}" (no space); standard SSE sends " {...}"
                     data = line[len(_DATA_PREFIX):].strip()
                     if data == "[DONE]":
                         break
                     try:
-                        yield json.loads(data)
+                        chunk = json.loads(data)
                     except json.JSONDecodeError:
                         logger.warning("Skipping unparseable SSE line: %s", data[:200])
                         continue
+                    if debug_log and request_id:
+                        chunks_for_log.append(chunk)
+                    yield chunk
+
         except httpx.TimeoutException as exc:
             logger.error(
                 "Streaming request to upstream timed out | url=%s | error_type=%s | detail=%s",
@@ -187,3 +222,7 @@ async def stream_request(
                 exc,
             )
             raise HTTPException(status_code=502, detail=f"Upstream stream failed: {exc}")
+
+    if debug_log and request_id and chunks_for_log:
+        from services.debug_logger import log_upstream_response
+        log_upstream_response(debug_log, request_id, 200, chunks_for_log, is_streaming=True)
