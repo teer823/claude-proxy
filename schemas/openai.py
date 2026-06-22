@@ -48,6 +48,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     tools: Optional[list[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict[str, Any]]] = None
+    thinking: Optional[dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------

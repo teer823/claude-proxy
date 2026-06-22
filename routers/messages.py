@@ -1,5 +1,6 @@
 """Router for the Anthropic Messages API endpoint."""
 
+import asyncio
 import json
 import logging
 import uuid
@@ -286,22 +287,45 @@ async def _stream_anthropic_events(
 
     yield _sse_event("ping", {"type": "ping"})
 
-    async for chunk in stream_request(upstream_url, headers, payload, read_timeout=read_timeout, request_id=request_id):
-        events, block_index, sent_message_start, sent_content_block_start, accumulated_text, usage_data = (
-            openai_stream_to_anthropic_events(
-                chunk=chunk,
-                message_id=message_id,
-                model=original_model,
-                block_index=block_index,
-                current_tool_calls=current_tool_calls,
-                sent_message_start=sent_message_start,
-                sent_content_block_start=sent_content_block_start,
-                accumulated_text=accumulated_text,
-                usage_data=usage_data,
+    # Hold an explicit reference to the inner async generator so we can close
+    # it eagerly when the client disconnects or an exception occurs.
+    # Without this, Python's async-generator finalizer may schedule aclose()
+    # while the generator coroutine is still on the call stack, producing:
+    #   RuntimeError: aclose(): asynchronous generator is already running
+    inner = stream_request(
+        upstream_url, headers, payload,
+        read_timeout=read_timeout,
+        request_id=request_id,
+    )
+    try:
+        async for chunk in inner:
+            events, block_index, sent_message_start, sent_content_block_start, accumulated_text, usage_data = (
+                openai_stream_to_anthropic_events(
+                    chunk=chunk,
+                    message_id=message_id,
+                    model=original_model,
+                    block_index=block_index,
+                    current_tool_calls=current_tool_calls,
+                    sent_message_start=sent_message_start,
+                    sent_content_block_start=sent_content_block_start,
+                    accumulated_text=accumulated_text,
+                    usage_data=usage_data,
+                )
             )
-        )
-        for event in events:
-            yield _sse_event(event["type"], event)
+            for event in events:
+                yield _sse_event(event["type"], event)
+    except asyncio.CancelledError:
+        # Client disconnected — close the upstream generator before re-raising
+        # so httpx can tear down the connection cleanly.
+        await inner.aclose()
+        raise
+    except Exception:
+        await inner.aclose()
+        raise
+    else:
+        # Normal completion — aclose() is a no-op on an exhausted generator
+        # but ensures httpx resources are released promptly.
+        await inner.aclose()
 
 
 # ---------------------------------------------------------------------------

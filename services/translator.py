@@ -556,7 +556,7 @@ def anthropic_to_openai_request(
     if thinking and isinstance(thinking, dict) and thinking.get("type") == "enabled":
         budget = thinking.get("budget_tokens", 0)
         if max_tokens <= budget:
-            new_max = budget + 1024
+            new_max = budget + 4096
             _logger.warning(
                 "max_tokens (%d) <= thinking.budget_tokens (%d); bumping max_tokens to %d",
                 max_tokens,
@@ -575,8 +575,9 @@ def anthropic_to_openai_request(
         stream=request.stream,
         tools=openai_tools,
         tool_choice=tool_choice,
-        # thinking is intentionally NOT forwarded — IBM ICA's OpenAI endpoint
-        # does not accept it and returns HTTP 404 when it is present.
+        # Forward thinking to IBM ICA — it supports the Anthropic thinking parameter
+        # and requires max_tokens > budget_tokens (enforced by the bump above).
+        thinking=thinking if thinking else None,
     )
 
 
