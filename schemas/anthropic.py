@@ -72,8 +72,10 @@ class Tool(BaseModel):
 
 
 class ToolChoice(BaseModel):
-    type: Literal["auto", "any", "tool"] = "auto"
+    type: Literal["auto", "any", "tool", "none"] = "auto"
     name: Optional[str] = None
+    # Allow extra fields for forward compatibility
+    model_config = {"extra": "allow"}
 
 
 class MessagesRequest(BaseModel):
@@ -87,8 +89,11 @@ class MessagesRequest(BaseModel):
     stop_sequences: Optional[list[str]] = None
     stream: Optional[bool] = False
     tools: Optional[list[Tool]] = None
-    tool_choice: Optional[ToolChoice] = None
+    tool_choice: Optional[Union[ToolChoice, dict[str, Any]]] = None
     metadata: Optional[dict[str, Any]] = None
+    thinking: Optional[dict[str, Any]] = None
+    # Allow extra fields for forward compatibility (e.g. new Anthropic API fields)
+    model_config = {"extra": "allow"}
 
 
 # ---------------------------------------------------------------------------

@@ -68,11 +68,138 @@ def _is_web_search_tool(tool: Any) -> bool:
     return t.startswith("web_search")
 
 
-def _check_unsupported_tools(request: MessagesRequest) -> JSONResponse | None:
-    """Return a 400 error if any unsupported built-in Anthropic tools are present.
+# ---------------------------------------------------------------------------
+# Claude Code built-in tool conversion
+# ---------------------------------------------------------------------------
 
-    web_search_* tools are handled natively by this proxy and are therefore
-    allowed through. All other non-function built-in types are rejected.
+# Maps canonical name to equivalent function-type tool definition.
+# Claude Code auto mode sends built-in tool types like "bash_20250124";
+# the proxy converts them to function tools so IBM ICA can handle them.
+_BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "bash": {
+        "type": "function",
+        "name": "bash",
+        "description": (
+            "Run commands in a bash shell. "
+            "Use this to execute shell commands, run scripts, install packages, "
+            "navigate the filesystem, and interact with the operating system."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to execute.",
+                },
+                "restart": {
+                    "type": "boolean",
+                    "description": "Restart the bash shell session (clears environment).",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+    "str_replace_based_edit_tool": {
+        "type": "function",
+        "name": "str_replace_based_edit_tool",
+        "description": (
+            "View, create, and edit files. "
+            "Supports commands: view, create, str_replace, insert, delete, undo_edit."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["view", "create", "str_replace", "insert", "delete", "undo_edit"],
+                    "description": "The editing command to execute.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path to the file or directory.",
+                },
+                "file_text": {
+                    "type": "string",
+                    "description": "Content to write when creating a new file.",
+                },
+                "old_str": {
+                    "type": "string",
+                    "description": "Text to search for and replace (str_replace command).",
+                },
+                "new_str": {
+                    "type": "string",
+                    "description": "Replacement text (str_replace command).",
+                },
+                "insert_line": {
+                    "type": "integer",
+                    "description": "Line number after which to insert text (insert command).",
+                },
+                "new_file": {
+                    "type": "string",
+                    "description": "Text to insert (insert command).",
+                },
+            },
+            "required": ["command", "path"],
+        },
+    },
+    "computer": {
+        "type": "function",
+        "name": "computer",
+        "description": "Control the computer using mouse, keyboard, and screenshot actions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "The computer action to perform.",
+                },
+                "coordinate": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "X,Y pixel coordinates for mouse actions.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to type.",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+def _builtin_tool_canonical_name(ttype: str) -> str | None:
+    """Map a built-in tool type string to its canonical function-schema key, or None."""
+    if ttype.startswith("bash_"):
+        return "bash"
+    if ttype.startswith("str_replace_based_edit_tool_"):
+        return "str_replace_based_edit_tool"
+    if ttype.startswith("text_editor_"):
+        # text_editor_* is the same functional interface as str_replace_based_edit_tool
+        return "str_replace_based_edit_tool"
+    if ttype.startswith("computer_"):
+        return "computer"
+    return None
+
+
+def _is_known_builtin_tool(tool: Any) -> bool:
+    """Return True if the tool is a known Claude Code built-in that can be converted."""
+    t = _tool_type(tool)
+    if t is None:
+        return False
+    return _builtin_tool_canonical_name(t) is not None
+
+
+def _check_unsupported_tools(request: MessagesRequest) -> JSONResponse | None:
+    """Return a 400 error if any truly unsupported built-in Anthropic tools are present.
+
+    Allowed through:
+      - type is None or 'function'  (standard custom tools)
+      - type starts with 'web_search'  (handled by proxy agentic loop)
+      - type is a known Claude Code built-in (bash_*, text_editor_*, etc.) — converted by
+        _convert_builtin_tools() before forwarding to upstream
+    All other non-function built-in types are rejected with 400.
     """
     if not request.tools:
         return None
@@ -81,7 +208,7 @@ def _check_unsupported_tools(request: MessagesRequest) -> JSONResponse | None:
         tool_name = (
             tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", "unknown")
         )
-        if ttype and ttype != "function" and not _is_web_search_tool(tool):
+        if ttype and ttype != "function" and not _is_web_search_tool(tool) and not _is_known_builtin_tool(tool):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -97,6 +224,43 @@ def _check_unsupported_tools(request: MessagesRequest) -> JSONResponse | None:
                 },
             )
     return None
+
+
+def _convert_builtin_tools(request: MessagesRequest) -> tuple[MessagesRequest, bool]:
+    """Replace Claude Code built-in tools with equivalent function-type tools.
+
+    Returns (modified_request, had_builtins).  When had_builtins is True the
+    caller should ensure the translator uses XML mode for the IBM ICA backend.
+    """
+    if not request.tools:
+        return request, False
+
+    had_builtins = any(_is_known_builtin_tool(t) for t in request.tools)
+    if not had_builtins:
+        return request, False
+
+    converted_tools = []
+    seen_canonical: set[str] = set()
+    for tool in request.tools:
+        ttype = _tool_type(tool)
+        if ttype and _is_known_builtin_tool(tool):
+            canonical = _builtin_tool_canonical_name(ttype)
+            if canonical and canonical not in seen_canonical:
+                schema = _BUILTIN_TOOL_SCHEMAS[canonical]
+                converted_tools.append(schema)
+                seen_canonical.add(canonical)
+                logger.debug(
+                    "Converting built-in tool type=%r to function tool name=%r",
+                    ttype,
+                    canonical,
+                )
+        else:
+            tool_dict = tool if isinstance(tool, dict) else tool.model_dump()
+            converted_tools.append(tool_dict)
+
+    data = request.model_dump()
+    data["tools"] = converted_tools
+    return MessagesRequest(**data), True
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +334,6 @@ def _strip_web_search_tools(request: MessagesRequest) -> tuple[MessagesRequest, 
     """Replace web_search built-in tools with an equivalent function tool definition.
 
     Returns a (modified_request, had_web_search) tuple.
-    The modified request replaces web_search_* built-in tools with a standard
-    function tool so the upstream model knows it can call web_search.
     """
     if not request.tools:
         return request, False
@@ -180,15 +342,12 @@ def _strip_web_search_tools(request: MessagesRequest) -> tuple[MessagesRequest, 
     if not had_web_search:
         return request, False
 
-    # Keep non-web-search tools and add the function tool definition
     remaining_tools = [t for t in request.tools if not _is_web_search_tool(t)]
     data = request.model_dump()
     data["tools"] = [
         (t if isinstance(t, dict) else t.model_dump()) for t in remaining_tools
     ]
-    # Inject the web_search function tool so upstream knows it can call it
     data["tools"].append(_WEB_SEARCH_FUNCTION_TOOL)
-    # Encourage the model to use tools (auto lets it decide when to search)
     if not data.get("tool_choice"):
         data["tool_choice"] = {"type": "auto"}
     return MessagesRequest(**data), True
@@ -203,11 +362,9 @@ def _append_tool_result(
     """Append the assistant message + a tool_result user message to the conversation."""
     data = request.model_dump()
 
-    # Append assistant turn with all content blocks (including the tool_use block)
     assistant_content = assistant_response.get("content", [])
     data["messages"].append({"role": "assistant", "content": assistant_content})
 
-    # Append user turn with the tool_result
     data["messages"].append({
         "role": "user",
         "content": [
@@ -232,11 +389,6 @@ async def _run_web_search_agentic_loop(
 ) -> dict[str, Any]:
     """Execute the agentic tool-call loop for web_search.
 
-    IBM ICA ignores native OpenAI tool definitions and tool_choice, so this loop
-    always uses XML mode: tool definitions are injected into the system prompt and
-    the model is instructed to respond with <function_calls> XML.  The translator's
-    existing XML parsers detect and extract the tool call from the response text.
-
     Returns the final Anthropic-format response dict.
     """
     current_request, _ = _strip_web_search_tools(request)
@@ -244,12 +396,8 @@ async def _run_web_search_agentic_loop(
     for iteration in range(_MAX_TOOL_ITERATIONS):
         logger.debug("Agentic loop iteration %d/%d", iteration + 1, _MAX_TOOL_ITERATIONS)
 
-        # Always force XML mode: inject the web_search tool into the system prompt
-        # and remove native tools so the upstream never sees tool definitions
-        # (which IBM ICA silently ignores).
         req_data = current_request.model_dump()
 
-        # Build the XML-mode system prompt with the tool description
         tool_hint = tools_to_system_prompt(req_data.get("tools") or [_WEB_SEARCH_FUNCTION_TOOL])
         existing_system = req_data.get("system") or ""
         if isinstance(existing_system, list):
@@ -259,20 +407,17 @@ async def _run_web_search_agentic_loop(
             )
         req_data["system"] = (tool_hint + "\n\n" + existing_system).strip()
 
-        # Strip tools and tool_choice — we send XML instructions instead
         req_data["tools"] = None
         req_data["tool_choice"] = None
 
         iter_request = MessagesRequest(**req_data)
         openai_req = anthropic_to_openai_request(iter_request, _get_settings().default_model)
         payload = openai_req.model_dump(exclude_none=True)
-        # Always non-streaming inside the loop so we can inspect tool calls
         payload["stream"] = False
 
         oai_response = await forward_request(upstream_url, headers, payload, read_timeout=read_timeout, request_id=request_id)
         anthropic_response = openai_to_anthropic_response(oai_response, current_request)
 
-        # Check if the model wants to call web_search
         content_blocks = anthropic_response.get("content", [])
         web_search_calls = [
             b for b in content_blocks
@@ -281,11 +426,9 @@ async def _run_web_search_agentic_loop(
 
         if not web_search_calls:
             logger.debug("Agentic loop complete after %d iteration(s)", iteration + 1)
-            # Restore the original model name in the response
             anthropic_response["model"] = request.model
             return anthropic_response
 
-        # Execute each web_search call and append results
         for call in web_search_calls:
             tool_use_id = call.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
             query = call.get("input", {}).get("query", "")
@@ -309,7 +452,6 @@ async def _run_web_search_agentic_loop(
                 current_request, anthropic_response, tool_use_id, search_result
             )
 
-    # Reached the iteration cap — return whatever the last response was
     logger.warning("Agentic loop hit iteration cap (%d)", _MAX_TOOL_ITERATIONS)
     anthropic_response["model"] = request.model
     return anthropic_response
@@ -327,7 +469,6 @@ async def _stream_from_anthropic_response(
 
     yield _sse_event("ping", {"type": "ping"})
 
-    # message_start
     yield _sse_event("message_start", {
         "type": "message_start",
         "message": {
@@ -398,11 +539,15 @@ async def create_message(
     """
     Proxy Anthropic Messages API requests to an OpenAI-compatible backend.
     Supports both streaming and non-streaming responses.
-    When a web_search built-in tool is present, the proxy executes the search
-    itself and feeds the results back to the model (agentic loop).
+    Claude Code built-in tools (bash, text_editor, etc.) are converted to
+    equivalent function tools before forwarding to IBM ICA.
+    Web search built-in tools are handled by the proxy agentic loop.
     """
     if (error_response := _check_unsupported_tools(request)) is not None:
         return error_response
+
+    # Convert Claude Code built-in tools (bash_*, text_editor_*, etc.) to function tools
+    request, _ = _convert_builtin_tools(request)
 
     settings = _get_settings()
     target_model = settings.default_model
@@ -452,7 +597,11 @@ async def create_message(
 
     if request.stream:
         return StreamingResponse(
-            _stream_anthropic_events(upstream_url, headers, payload, request.model, read_timeout=settings.upstream_read_timeout, request_id=rid),
+            _stream_anthropic_events(
+                upstream_url, headers, payload, request.model,
+                read_timeout=settings.upstream_read_timeout,
+                request_id=rid,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -461,6 +610,10 @@ async def create_message(
             },
         )
 
-    oai_response = await forward_request(upstream_url, headers, payload, read_timeout=settings.upstream_read_timeout, request_id=rid)
+    oai_response = await forward_request(
+        upstream_url, headers, payload,
+        read_timeout=settings.upstream_read_timeout,
+        request_id=rid,
+    )
     anthropic_response = openai_to_anthropic_response(oai_response, request)
     return JSONResponse(content=anthropic_response)

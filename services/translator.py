@@ -534,7 +534,9 @@ def anthropic_to_openai_request(
             tc = request.tool_choice
             tc_type = tc.get("type") if isinstance(tc, dict) else getattr(tc, "type", "auto")
             tc_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
-            if tc_type == "auto":
+            if tc_type == "none":
+                tool_choice = "none"
+            elif tc_type == "auto":
                 tool_choice = "auto"
             elif tc_type == "any":
                 # Use "auto" for compatibility with backends that don't support "required"
@@ -545,16 +547,36 @@ def anthropic_to_openai_request(
             else:
                 tool_choice = "auto"
 
+    # Extended thinking: auto-bump max_tokens if needed, but do NOT forward the
+    # thinking field itself to IBM ICA — it uses an OpenAI-compatible endpoint
+    # that does not recognise the Anthropic-specific "thinking" parameter and
+    # will return HTTP 404 with an empty body if it is present.
+    thinking = request.thinking if hasattr(request, "thinking") else None
+    max_tokens = request.max_tokens
+    if thinking and isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens", 0)
+        if max_tokens <= budget:
+            new_max = budget + 1024
+            _logger.warning(
+                "max_tokens (%d) <= thinking.budget_tokens (%d); bumping max_tokens to %d",
+                max_tokens,
+                budget,
+                new_max,
+            )
+            max_tokens = new_max
+
     return ChatCompletionRequest(
         model=target_model,
         messages=openai_messages,
-        max_tokens=request.max_tokens,
+        max_tokens=max_tokens,
         temperature=request.temperature,
         top_p=request.top_p,
         stop=request.stop_sequences,
         stream=request.stream,
         tools=openai_tools,
         tool_choice=tool_choice,
+        # thinking is intentionally NOT forwarded — IBM ICA's OpenAI endpoint
+        # does not accept it and returns HTTP 404 when it is present.
     )
 
 
