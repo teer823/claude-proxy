@@ -42,14 +42,37 @@ settings = Settings()
 # Logging
 # ---------------------------------------------------------------------------
 
+import os as _os
+
+_log_level = logging.DEBUG if settings.debug_mode else logging.INFO
+_log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=_log_level,
+    format=_log_format,
 )
 # Suppress uvicorn's per-request access log (200s are noise; errors still surface
 # via the application logger and uvicorn's error logger).
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+# Suppress verbose httpx / httpcore connection logs — they add noise without value.
+# In debug mode keep them at INFO so TLS/redirect info shows up if needed.
+_http_log_level = logging.INFO if settings.debug_mode else logging.WARNING
+logging.getLogger("httpx").setLevel(_http_log_level)
+logging.getLogger("httpcore").setLevel(_http_log_level)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Application log file — always write to <debug_log_dir>/proxy.log so log
+# output is co-located with the debug request/response files and is not
+# scattered across wherever the process was launched from.
+# ---------------------------------------------------------------------------
+_os.makedirs(settings.debug_log_dir, exist_ok=True)
+_app_log_path = _os.path.join(settings.debug_log_dir, "proxy.log")
+_file_handler = logging.FileHandler(_app_log_path, encoding="utf-8")
+_file_handler.setLevel(_log_level)
+_file_handler.setFormatter(logging.Formatter(_log_format))
+logging.getLogger().addHandler(_file_handler)
+logger.info("Application log file: %s", _app_log_path)
 
 # ---------------------------------------------------------------------------
 # Debug logging setup

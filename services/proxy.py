@@ -88,6 +88,9 @@ async def forward_request(
         from services.debug_logger import log_upstream_request
         log_upstream_request(debug_log, request_id, url, headers, payload)
 
+    rid_tag = f"[{request_id}] " if request_id else ""
+    logger.debug("%supstream → POST %s", rid_tag, url)
+
     timeout = httpx.Timeout(connect=10.0, write=60.0, read=read_timeout, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -117,6 +120,7 @@ async def forward_request(
             )
             raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}")
 
+        logger.debug("%supstream ← %d (non-stream)", rid_tag, response.status_code)
         if response.status_code != 200:
             _log_upstream_error(url, response.status_code, response.text)
             raise HTTPException(
@@ -163,6 +167,9 @@ async def stream_request(
         from services.debug_logger import log_upstream_request
         log_upstream_request(debug_log, request_id, url, headers, payload)
 
+    rid_tag = f"[{request_id}] " if request_id else ""
+    logger.debug("%supstream → POST %s (stream)", rid_tag, url)
+
     timeout = httpx.Timeout(connect=10.0, write=60.0, read=read_timeout, pool=5.0)
     chunks_for_log: list[dict[str, Any]] = []
 
@@ -178,6 +185,7 @@ async def stream_request(
                         detail=f"Upstream error: {body_text[:500]}",
                     )
 
+                logger.debug("%supstream ← %d (stream)", rid_tag, response.status_code)
                 async for line in response.aiter_lines():
                     line = line.strip()
                     if not line:

@@ -61,7 +61,14 @@ def _parse_xml_tool_calls_regex(xml_src: str) -> list[dict[str, Any]]:
 def _parse_xml_tool_calls(
     text: str,
 ) -> tuple[Optional[str], list[dict[str, Any]]]:
-    """Detect <function_calls> XML in text and convert to tool_use blocks."""
+    """Detect <function_calls> XML in text and convert to tool_use blocks.
+
+    Uses the regex parser as the primary strategy because parameter values often
+    contain unescaped XML special characters (shell commands with ``<``, ``>``,
+    ``|``, ``&``).  ET.fromstring() is tried first only when the source is small
+    enough that a strict parse is likely to succeed cleanly; otherwise we go
+    straight to regex to avoid noisy ParseError warnings.
+    """
     if "<function_calls>" not in text:
         return text, []
 
@@ -72,27 +79,51 @@ def _parse_xml_tool_calls(
         xml_src = xml_src[: xml_src.index(closing) + len(closing)]
 
     tool_blocks: list[dict[str, Any]] = []
-    try:
-        root = ET.fromstring(xml_src)
-        for invoke in root.findall("invoke"):
-            tool_name = invoke.get("name", "")
-            params: dict[str, Any] = {}
-            for param in invoke.findall("parameter"):
-                pname = param.get("name", "")
-                pvalue = (param.text or "").strip()
-                try:
-                    params[pname] = json.loads(pvalue)
-                except (json.JSONDecodeError, ValueError):
-                    params[pname] = pvalue
-            tool_blocks.append({
-                "type": "tool_use",
-                "id": f"toolu_{uuid.uuid4().hex[:8]}",
-                "name": tool_name,
-                "input": params,
-            })
-    except ET.ParseError:
+
+    # Try ET first only when the source looks clean (no bare < or > outside tags).
+    # A cheap heuristic: if the parameter content contains unescaped angle brackets
+    # that would break strict XML, skip ET and go straight to regex.
+    _param_content_re = re.compile(
+        r'<parameter\s+name=["\'][^"\']*["\']>(.*?)</parameter>',
+        re.DOTALL,
+    )
+    has_unescaped = any(
+        ("<" in m.group(1) or ">" in m.group(1) or "&" in m.group(1))
+        for m in _param_content_re.finditer(xml_src)
+    )
+
+    if not has_unescaped:
+        try:
+            root = ET.fromstring(xml_src)
+            for invoke in root.findall("invoke"):
+                tool_name = invoke.get("name", "")
+                params: dict[str, Any] = {}
+                for param in invoke.findall("parameter"):
+                    pname = param.get("name", "")
+                    pvalue = (param.text or "").strip()
+                    try:
+                        params[pname] = json.loads(pvalue)
+                    except (json.JSONDecodeError, ValueError):
+                        params[pname] = pvalue
+                tool_blocks.append({
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                    "name": tool_name,
+                    "input": params,
+                })
+        except ET.ParseError:
+            # Unexpected parse failure even without obvious special chars — fall through to regex
+            tool_blocks = []
+
+    if not tool_blocks:
+        # Primary path for shell commands / any XML with unescaped special chars
         tool_blocks = _parse_xml_tool_calls_regex(xml_src)
         if not tool_blocks:
+            _logger.warning(
+                "XML tool-call parse found no invoke blocks. "
+                "Treating as plain text. Source preview: %.200r",
+                xml_src,
+            )
             return text, []
 
     remaining = pre.rstrip() or None
@@ -129,7 +160,12 @@ def _parse_tool_use_tags(
         raw = m.group(1).strip()
         try:
             obj = json.loads(raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as json_err:
+            _logger.warning(
+                "tool_use tag contained invalid JSON (%s); treating as plain text. Raw: %.200r",
+                json_err,
+                raw,
+            )
             # Not valid JSON — treat the whole thing as plain text
             remaining_parts.append(m.group(0))
             continue
@@ -547,18 +583,50 @@ def anthropic_to_openai_request(
             else:
                 tool_choice = "auto"
 
-    # Extended thinking: auto-bump max_tokens if needed, but do NOT forward the
-    # thinking field itself to IBM ICA — it uses an OpenAI-compatible endpoint
-    # that does not recognise the Anthropic-specific "thinking" parameter and
-    # will return HTTP 404 with an empty body if it is present.
+    # Extended thinking: IBM ICA uses an OpenAI-compatible endpoint that does NOT
+    # support the Anthropic-specific "thinking" parameter — forwarding it causes
+    # HTTP 400 ("max_tokens must be greater than thinking.budget_tokens") or a
+    # silent HTTP 404 with an empty body after a 3-minute timeout.
+    #
+    # Strategy:
+    #   1. Read thinking/budget_tokens from the incoming request.
+    #   2. Ensure max_tokens > budget_tokens (IBM ICA enforces this even when we
+    #      strip thinking, because the upstream model still uses extended thinking
+    #      internally when the budget is set via system-prompt conventions).
+    #   3. Do NOT include thinking in the ChatCompletionRequest sent upstream.
     thinking = request.thinking if hasattr(request, "thinking") else None
     max_tokens = request.max_tokens
-    if thinking and isinstance(thinking, dict) and thinking.get("type") == "enabled":
+
+    # IBM ICA rejects requests with small max_tokens values when the thinking field
+    # is present (even when type=disabled).  The model appears to require max_tokens
+    # to exceed an internal budget threshold.  Normal Claude Code requests use 32000;
+    # we enforce a floor of 16384 to cover summary/reflection calls that Claude Code
+    # sends with max_tokens=64.
+    _MIN_MAX_TOKENS = 16384
+    if max_tokens < _MIN_MAX_TOKENS:
+        _logger.info(
+            "max_tokens=%d is below minimum %d; bumping to %d",
+            max_tokens,
+            _MIN_MAX_TOKENS,
+            _MIN_MAX_TOKENS,
+        )
+        max_tokens = _MIN_MAX_TOKENS
+
+    if thinking and isinstance(thinking, dict):
         budget = thinking.get("budget_tokens", 0)
-        if max_tokens <= budget:
+        thinking_type = thinking.get("type", "")
+        _logger.debug(
+            "thinking field present: type=%r budget_tokens=%d max_tokens=%d (after floor)",
+            thinking_type,
+            budget,
+            max_tokens,
+        )
+        # For enabled thinking: also ensure max_tokens > budget_tokens
+        if thinking_type == "enabled" and max_tokens <= budget:
             new_max = budget + 4096
             _logger.warning(
-                "max_tokens (%d) <= thinking.budget_tokens (%d); bumping max_tokens to %d",
+                "thinking enabled: max_tokens (%d) <= budget_tokens (%d); "
+                "bumping max_tokens to %d before forwarding to upstream",
                 max_tokens,
                 budget,
                 new_max,
@@ -575,9 +643,8 @@ def anthropic_to_openai_request(
         stream=request.stream,
         tools=openai_tools,
         tool_choice=tool_choice,
-        # Forward thinking to IBM ICA — it supports the Anthropic thinking parameter
-        # and requires max_tokens > budget_tokens (enforced by the bump above).
-        thinking=thinking if thinking else None,
+        # thinking is intentionally NOT forwarded — IBM ICA does not support it
+        # and returns HTTP 400 / silent 404 when it is present.
     )
 
 
@@ -636,10 +703,18 @@ def openai_to_anthropic_response(
     tool_calls = message.get("tool_calls") or []
     for tc in tool_calls:
         func = tc.get("function", {})
+        raw_args = func.get("arguments", "{}")
         try:
-            input_data = json.loads(func.get("arguments", "{}"))
-        except json.JSONDecodeError:
-            input_data = {"raw": func.get("arguments", "")}
+            input_data = json.loads(raw_args)
+        except json.JSONDecodeError as json_err:
+            _logger.warning(
+                "Failed to parse tool_call arguments as JSON (%s); using raw string. "
+                "Tool=%r  args preview: %.200r",
+                json_err,
+                func.get("name", "?"),
+                raw_args,
+            )
+            input_data = {"raw": raw_args}
         content_blocks.append({
             "type": "tool_use",
             "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),

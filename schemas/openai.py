@@ -48,7 +48,8 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     tools: Optional[list[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict[str, Any]]] = None
-    thinking: Optional[dict[str, Any]] = None
+    # Note: thinking is intentionally excluded — IBM ICA does not support it
+    # and returns HTTP 400 / silent 404 when it is present.
 
 
 # ---------------------------------------------------------------------------

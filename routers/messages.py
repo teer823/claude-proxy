@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -33,9 +34,21 @@ def _get_settings():
     return settings
 
 
-def _get_request_id(http_request: Request) -> str | None:
-    """Return the debug request_id stored on request.state by the middleware, or None."""
-    return getattr(http_request.state, "debug_request_id", None)
+def _make_request_id() -> str:
+    """Generate a short unique ID for correlating log lines for a single request."""
+    return uuid.uuid4().hex[:8]
+
+
+def _get_or_make_request_id(http_request: Request) -> str:
+    """Return the debug request_id stored by the middleware, or generate a new one.
+
+    Also stores the generated ID on request.state so downstream helpers can use it.
+    """
+    rid = getattr(http_request.state, "debug_request_id", None)
+    if not rid:
+        rid = _make_request_id()
+        http_request.state.debug_request_id = rid
+    return rid
 
 
 def _build_upstream_headers(api_key: str) -> dict[str, str]:
@@ -416,9 +429,10 @@ async def _run_web_search_agentic_loop(
     Returns the final Anthropic-format response dict.
     """
     current_request, _ = _strip_web_search_tools(request)
+    rid_prefix = f"[{request_id}] " if request_id else ""
 
     for iteration in range(_MAX_TOOL_ITERATIONS):
-        logger.debug("Agentic loop iteration %d/%d", iteration + 1, _MAX_TOOL_ITERATIONS)
+        logger.debug("%sweb_search loop iter=%d/%d", rid_prefix, iteration + 1, _MAX_TOOL_ITERATIONS)
 
         req_data = current_request.model_dump()
 
@@ -457,8 +471,10 @@ async def _run_web_search_agentic_loop(
             tool_use_id = call.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
             query = call.get("input", {}).get("query", "")
             logger.info(
-                "Executing web_search (iteration %d): query=%r provider=%s",
+                "%sweb_search iter=%d/%d query=%r provider=%s",
+                rid_prefix,
                 iteration + 1,
+                _MAX_TOOL_ITERATIONS,
                 query,
                 provider,
             )
@@ -468,15 +484,20 @@ async def _run_web_search_agentic_loop(
                     provider=provider,
                     tavily_api_key=tavily_api_key or None,
                 )
+                logger.debug(
+                    "%sweb_search result: %d chars",
+                    rid_prefix,
+                    len(search_result),
+                )
             except Exception as exc:
-                logger.error("web_search failed: %s", exc)
+                logger.error("%sweb_search failed: %s", rid_prefix, exc)
                 search_result = f"Search failed: {exc}"
 
             current_request = _append_tool_result(
                 current_request, anthropic_response, tool_use_id, search_result
             )
 
-    logger.warning("Agentic loop hit iteration cap (%d)", _MAX_TOOL_ITERATIONS)
+    logger.warning("%sagentic loop hit iteration cap (%d)", rid_prefix, _MAX_TOOL_ITERATIONS)
     anthropic_response["model"] = request.model
     return anthropic_response
 
@@ -567,7 +588,25 @@ async def create_message(
     equivalent function tools before forwarding to IBM ICA.
     Web search built-in tools are handled by the proxy agentic loop.
     """
+    # Assign a request ID early so all log lines for this request are correlated.
+    rid = _get_or_make_request_id(http_request)
+    start_time = time.monotonic()
+
+    # Compute summary fields for the entry log line.
+    tool_count = len(request.tools) if request.tools else 0
+    msg_count = len(request.messages)
+    logger.info(
+        "[%s] → POST /v1/messages model=%s stream=%s tools=%d messages=%d",
+        rid,
+        request.model,
+        request.stream,
+        tool_count,
+        msg_count,
+    )
+
     if (error_response := _check_unsupported_tools(request)) is not None:
+        elapsed = time.monotonic() - start_time
+        logger.info("[%s] ← 400 unsupported_tool duration=%.2fs", rid, elapsed)
         return error_response
 
     # Convert Claude Code built-in tools (bash_*, text_editor_*, etc.) to function tools
@@ -576,11 +615,10 @@ async def create_message(
     settings = _get_settings()
     target_model = settings.default_model
     logger.debug(
-        "Incoming model=%r target model=%r stream=%s has_web_search=%s",
-        request.model,
+        "[%s] target_model=%r has_web_search=%s",
+        rid,
         target_model,
-        request.stream,
-        request.tools and any(_is_web_search_tool(t) for t in request.tools),
+        bool(request.tools and any(_is_web_search_tool(t) for t in request.tools)),
     )
 
     upstream_url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
@@ -592,15 +630,35 @@ async def create_message(
 
     # --- Web-search agentic loop path ---
     if has_web_search:
-        final_response = await _run_web_search_agentic_loop(
-            request=request,
-            upstream_url=upstream_url,
-            headers=headers,
-            provider=settings.web_search_provider,
-            tavily_api_key=settings.tavily_api_key,
-            read_timeout=settings.upstream_read_timeout,
-            request_id=_get_request_id(http_request),
+        try:
+            final_response = await _run_web_search_agentic_loop(
+                request=request,
+                upstream_url=upstream_url,
+                headers=headers,
+                provider=settings.web_search_provider,
+                tavily_api_key=settings.tavily_api_key,
+                read_timeout=settings.upstream_read_timeout,
+                request_id=rid,
+            )
+        except Exception as exc:
+            elapsed = time.monotonic() - start_time
+            logger.error(
+                "[%s] ← ERROR web_search loop failed: %s: %s  duration=%.2fs",
+                rid, type(exc).__name__, exc, elapsed,
+            )
+            raise
+
+        elapsed = time.monotonic() - start_time
+        usage = final_response.get("usage", {})
+        logger.info(
+            "[%s] ← 200 stop_reason=%s input_tokens=%d output_tokens=%d duration=%.2fs",
+            rid,
+            final_response.get("stop_reason", "?"),
+            usage.get("input_tokens", 0),
+            usage.get("output_tokens", 0),
+            elapsed,
         )
+
         if request.stream:
             return StreamingResponse(
                 _stream_from_anthropic_response(final_response, request.model),
@@ -617,15 +675,50 @@ async def create_message(
     openai_request = anthropic_to_openai_request(request, target_model)
     payload = openai_request.model_dump(exclude_none=True)
 
-    rid = _get_request_id(http_request)
-
     if request.stream:
+        async def _logged_stream() -> AsyncIterator[str]:
+            """Wrap the SSE generator to log completion metrics after stream ends."""
+            final_usage: dict[str, Any] = {}
+            final_stop_reason: str = "?"
+            try:
+                async for chunk_str in _stream_anthropic_events(
+                    upstream_url, headers, payload, request.model,
+                    read_timeout=settings.upstream_read_timeout,
+                    request_id=rid,
+                ):
+                    # Extract usage/stop_reason from the last message_delta event
+                    # without buffering the whole stream — just peek at the JSON.
+                    try:
+                        evt_data = chunk_str.split("\n", 1)[-1].strip()
+                        if evt_data.startswith(" "):
+                            evt_data = evt_data.strip()
+                        parsed = json.loads(evt_data)
+                        if parsed.get("type") == "message_delta":
+                            final_stop_reason = parsed.get("delta", {}).get("stop_reason", "?") or "?"
+                            final_usage = parsed.get("usage", {})
+                    except Exception:
+                        pass
+                    yield chunk_str
+            except Exception as exc:
+                elapsed = time.monotonic() - start_time
+                logger.error(
+                    "[%s] ← ERROR stream failed: %s: %s  duration=%.2fs",
+                    rid, type(exc).__name__, exc, elapsed,
+                )
+                raise
+            else:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    "[%s] ← 200 stop_reason=%s input_tokens=%d output_tokens=%d duration=%.2fs (stream)",
+                    rid,
+                    final_stop_reason,
+                    final_usage.get("input_tokens", 0),
+                    final_usage.get("output_tokens", 0),
+                    elapsed,
+                )
+
         return StreamingResponse(
-            _stream_anthropic_events(
-                upstream_url, headers, payload, request.model,
-                read_timeout=settings.upstream_read_timeout,
-                request_id=rid,
-            ),
+            _logged_stream(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -634,10 +727,30 @@ async def create_message(
             },
         )
 
-    oai_response = await forward_request(
-        upstream_url, headers, payload,
-        read_timeout=settings.upstream_read_timeout,
-        request_id=rid,
-    )
+    # Non-streaming standard path
+    try:
+        oai_response = await forward_request(
+            upstream_url, headers, payload,
+            read_timeout=settings.upstream_read_timeout,
+            request_id=rid,
+        )
+    except Exception as exc:
+        elapsed = time.monotonic() - start_time
+        logger.error(
+            "[%s] ← ERROR forward failed: %s: %s  duration=%.2fs",
+            rid, type(exc).__name__, exc, elapsed,
+        )
+        raise
+
     anthropic_response = openai_to_anthropic_response(oai_response, request)
+    elapsed = time.monotonic() - start_time
+    usage = anthropic_response.get("usage", {})
+    logger.info(
+        "[%s] ← 200 stop_reason=%s input_tokens=%d output_tokens=%d duration=%.2fs",
+        rid,
+        anthropic_response.get("stop_reason", "?"),
+        usage.get("input_tokens", 0),
+        usage.get("output_tokens", 0),
+        elapsed,
+    )
     return JSONResponse(content=anthropic_response)
