@@ -22,6 +22,27 @@ from schemas.openai import (
 # XML tool-call parser
 # ---------------------------------------------------------------------------
 
+def _parse_xml_param_value(pvalue: str) -> Any:
+    """Parse an XML parameter value, preserving strings that look like numbers.
+
+    Plain ``json.loads`` would silently convert a bare ``12345`` to the integer
+    ``12345``, which breaks tools whose schema declares the parameter as a
+    ``string`` (e.g. ``taskId``).  We only attempt JSON decoding for values that
+    are clearly structured JSON: objects ``{…}``, arrays ``[…]``, or the
+    JSON literals ``true``, ``false``, and ``null``.  Everything else is kept as
+    a plain Python string.
+    """
+    if not pvalue:
+        return pvalue
+    first = pvalue[0]
+    if first in ("{", "[") or pvalue in ("true", "false", "null"):
+        try:
+            return json.loads(pvalue)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return pvalue
+
+
 def _parse_xml_tool_calls_regex(xml_src: str) -> list[dict[str, Any]]:
     """
     Regex-based fallback parser for <function_calls> XML.
@@ -45,10 +66,7 @@ def _parse_xml_tool_calls_regex(xml_src: str) -> list[dict[str, Any]]:
         ):
             pname = param_match.group(1)
             pvalue = param_match.group(2).strip()
-            try:
-                params[pname] = json.loads(pvalue)
-            except (json.JSONDecodeError, ValueError):
-                params[pname] = pvalue
+            params[pname] = _parse_xml_param_value(pvalue)
         tool_blocks.append({
             "type": "tool_use",
             "id": f"toolu_{uuid.uuid4().hex[:8]}",
@@ -101,10 +119,7 @@ def _parse_xml_tool_calls(
                 for param in invoke.findall("parameter"):
                     pname = param.get("name", "")
                     pvalue = (param.text or "").strip()
-                    try:
-                        params[pname] = json.loads(pvalue)
-                    except (json.JSONDecodeError, ValueError):
-                        params[pname] = pvalue
+                    params[pname] = _parse_xml_param_value(pvalue)
                 tool_blocks.append({
                     "type": "tool_use",
                     "id": f"toolu_{uuid.uuid4().hex[:8]}",
