@@ -145,6 +145,77 @@ def _parse_xml_tool_calls(
     return remaining, tool_blocks
 
 
+def _parse_tool_call_tags(
+    text: str,
+) -> tuple[Optional[str], list[dict[str, Any]]]:
+    """Detect <tool_call>JSON</tool_call> blocks in text and convert to tool_use blocks.
+
+    Some models (e.g. Qwen, Mistral via OpenAI-compatible endpoints) return tool
+    calls wrapped in <tool_call> tags with a JSON body, e.g.:
+
+        <tool_call>
+        {"name": "bash", "arguments": {"command": "ls -la"}}
+        </tool_call>
+
+    The JSON may have either an ``arguments`` key (OpenAI-style) or an ``input``
+    key (Anthropic-style).
+    """
+    if "<tool_call>" not in text:
+        return text, []
+
+    tool_blocks: list[dict[str, Any]] = []
+    remaining_parts: list[str] = []
+    last_end = 0
+
+    for m in re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL):
+        # Collect text before this tag
+        before = text[last_end: m.start()].strip()
+        if before:
+            remaining_parts.append(before)
+        last_end = m.end()
+
+        raw = m.group(1).strip()
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as json_err:
+            _logger.warning(
+                "tool_call tag contained invalid JSON (%s); treating as plain text. Raw: %.200r",
+                json_err,
+                raw,
+            )
+            remaining_parts.append(m.group(0))
+            continue
+
+        if isinstance(obj, dict):
+            # Support both "arguments" (OpenAI-style) and "input" (Anthropic-style) keys
+            input_data = obj.get("arguments") or obj.get("input") or {}
+            # arguments may itself be a JSON string
+            if isinstance(input_data, str):
+                try:
+                    input_data = json.loads(input_data)
+                except json.JSONDecodeError:
+                    input_data = {"raw": input_data}
+            tool_blocks.append({
+                "type": "tool_use",
+                "id": obj.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                "name": obj.get("name", ""),
+                "input": input_data,
+            })
+        else:
+            remaining_parts.append(m.group(0))
+
+    # Collect any trailing text
+    tail = text[last_end:].strip()
+    if tail:
+        remaining_parts.append(tail)
+
+    if not tool_blocks:
+        return text, []
+
+    remaining = "\n".join(remaining_parts).strip() or None
+    return remaining, tool_blocks
+
+
 def _parse_tool_use_tags(
     text: str,
 ) -> tuple[Optional[str], list[dict[str, Any]]]:
@@ -705,14 +776,21 @@ def openai_to_anthropic_response(
                 content_blocks.append({"type": "text", "text": remaining_text})
             content_blocks.extend(xml_tool_blocks)
         else:
-            # Try <tool_use>JSON</tool_use> format
+            # Try <tool_use>JSON</tool_use> format (IBM watsonx)
             remaining_text2, tag_tool_blocks = _parse_tool_use_tags(text_content)
             if tag_tool_blocks:
                 if remaining_text2:
                     content_blocks.append({"type": "text", "text": remaining_text2})
                 content_blocks.extend(tag_tool_blocks)
             else:
-                content_blocks.append({"type": "text", "text": text_content})
+                # Try <tool_call>JSON</tool_call> format (Qwen / Mistral style)
+                remaining_text3, tc_tool_blocks = _parse_tool_call_tags(text_content)
+                if tc_tool_blocks:
+                    if remaining_text3:
+                        content_blocks.append({"type": "text", "text": remaining_text3})
+                    content_blocks.extend(tc_tool_blocks)
+                else:
+                    content_blocks.append({"type": "text", "text": text_content})
 
     # Structured tool calls from the OpenAI response
     tool_calls = message.get("tool_calls") or []
@@ -832,12 +910,12 @@ def openai_stream_to_anthropic_events(
         accumulated_text += text_delta
         # Once a full XML marker is detected we stop streaming and buffer
         # everything until finish_reason so the whole block can be parsed.
-        if "<function_calls>" not in accumulated_text and "<tool_use>" not in accumulated_text:
+        if "<function_calls>" not in accumulated_text and "<tool_use>" not in accumulated_text and "<tool_call>" not in accumulated_text:
             # Guard against XML markers split across chunk boundaries by
             # retaining a tail that could still be a partial prefix of either
             # marker.  Only the "safe" prefix (everything before that tail) is
             # flushed immediately.
-            xml_markers = ["<function_calls>", "<tool_use>"]
+            xml_markers = ["<function_calls>", "<tool_use>", "<tool_call>"]
             max_marker_len = max(len(m) for m in xml_markers)
 
             # Find the longest suffix of accumulated_text that is a prefix of
@@ -908,7 +986,7 @@ def openai_stream_to_anthropic_events(
 
     if finish_reason:
         # Flush any held-back text that turned out not to be an XML marker
-        if accumulated_text and "<function_calls>" not in accumulated_text and "<tool_use>" not in accumulated_text:
+        if accumulated_text and "<function_calls>" not in accumulated_text and "<tool_use>" not in accumulated_text and "<tool_call>" not in accumulated_text:
             if not sent_content_block_start.get(block_index):
                 events.append({
                     "type": "content_block_start",
@@ -964,7 +1042,7 @@ def openai_stream_to_anthropic_events(
                     })
                 finish_reason = "tool_calls"
 
-        # Try <tool_use>JSON</tool_use> format
+        # Try <tool_use>JSON</tool_use> format (IBM watsonx)
         elif accumulated_text and "<tool_use>" in accumulated_text:
             remaining_text, tag_tool_blocks = _parse_tool_use_tags(accumulated_text)
             accumulated_text = ""
@@ -1001,6 +1079,47 @@ def openai_stream_to_anthropic_events(
                         "delta": {
                             "type": "input_json_delta",
                             "partial_json": json.dumps(tag_tc["input"], ensure_ascii=False),
+                        },
+                    })
+                finish_reason = "tool_calls"
+
+        # Try <tool_call>JSON</tool_call> format (Qwen / Mistral style)
+        elif accumulated_text and "<tool_call>" in accumulated_text:
+            remaining_text, tc_tool_blocks = _parse_tool_call_tags(accumulated_text)
+            accumulated_text = ""
+            if tc_tool_blocks:
+                if remaining_text:
+                    if not sent_content_block_start.get(block_index):
+                        events.append({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                        sent_content_block_start[block_index] = True
+                    events.append({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": remaining_text},
+                    })
+                for i, tc in enumerate(tc_tool_blocks):
+                    tb_idx = (block_index + 1 + i) if sent_content_block_start.get(block_index) else (block_index + i)
+                    events.append({
+                        "type": "content_block_start",
+                        "index": tb_idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": {},
+                        },
+                    })
+                    sent_content_block_start[tb_idx] = True
+                    events.append({
+                        "type": "content_block_delta",
+                        "index": tb_idx,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(tc["input"], ensure_ascii=False),
                         },
                     })
                 finish_reason = "tool_calls"
