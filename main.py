@@ -292,9 +292,13 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
                 _ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 _user_agent = request.headers.get("user-agent", "-")
                 _referer = request.headers.get("referer", "-")
+                _auth_header_raw = request.headers.get("authorization", "-")
+                _xapi_key = request.headers.get("x-api-key", "-")
                 _line = (
                     f"{_ts} UNAUTH ip={client_ip} method={request.method}"
                     f" path={request.url.path}"
+                    f" authorization={_auth_header_raw!r}"
+                    f" x-api-key={_xapi_key!r}"
                     f" user-agent={_user_agent!r}"
                     f" referer={_referer!r}\n"
                 )
