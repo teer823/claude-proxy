@@ -252,8 +252,9 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         if not required_key:
             return await call_next(request)
 
-        # Always allow health-check probes regardless of origin.
-        if request.url.path in _PUBLIC_PATHS:
+        # Always allow health-check probes and CORS preflight requests.
+        # OPTIONS requests are browser preflight checks — they never carry auth headers.
+        if request.url.path in _PUBLIC_PATHS or request.method == "OPTIONS":
             return await call_next(request)
 
         # Determine the real client IP.
@@ -290,17 +291,11 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
                 _debug_log_path = _os.path.join(settings.debug_log_dir, "proxy_debug.log")
                 _ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                _user_agent = request.headers.get("user-agent", "-")
-                _referer = request.headers.get("referer", "-")
-                _auth_header_raw = request.headers.get("authorization", "-")
-                _xapi_key = request.headers.get("x-api-key", "-")
+                _headers_str = " ".join(f"{k}={v!r}" for k, v in request.headers.items())
                 _line = (
                     f"{_ts} UNAUTH ip={client_ip} method={request.method}"
                     f" path={request.url.path}"
-                    f" authorization={_auth_header_raw!r}"
-                    f" x-api-key={_xapi_key!r}"
-                    f" user-agent={_user_agent!r}"
-                    f" referer={_referer!r}\n"
+                    f" headers=[{_headers_str}]\n"
                 )
                 with open(_debug_log_path, "a", encoding="utf-8") as _f:
                     _f.write(_line)
