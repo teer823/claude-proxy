@@ -284,6 +284,24 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
                 request.method,
                 request.url.path,
             )
+            # Write a structured line to proxy_debug.log for audit purposes.
+            try:
+                import datetime as _dt
+
+                _debug_log_path = _os.path.join(settings.debug_log_dir, "proxy_debug.log")
+                _ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _user_agent = request.headers.get("user-agent", "-")
+                _referer = request.headers.get("referer", "-")
+                _line = (
+                    f"{_ts} UNAUTH ip={client_ip} method={request.method}"
+                    f" path={request.url.path}"
+                    f" user-agent={_user_agent!r}"
+                    f" referer={_referer!r}\n"
+                )
+                with open(_debug_log_path, "a", encoding="utf-8") as _f:
+                    _f.write(_line)
+            except Exception as _exc:
+                logger.warning("Failed to write to proxy_debug.log: %s", _exc)
             return JSONResponse(
                 status_code=401,
                 content={
