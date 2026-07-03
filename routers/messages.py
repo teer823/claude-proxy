@@ -11,7 +11,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from schemas.anthropic import MessagesRequest
-from services.proxy import forward_request, stream_request
+from services.proxy import forward_request, stream_request, stream_to_completion
 from services.translator import (
     anthropic_to_openai_request,
     openai_stream_to_anthropic_events,
@@ -58,9 +58,12 @@ def _build_upstream_headers(api_key: str) -> dict[str, str]:
     }
 
 
+# "" prefix built via chr() to survive markdown rendering of this source file.
+_SSE_DATA_PREFIX = chr(100) + chr(97) + chr(116) + chr(97) + chr(58)  # d-a-t-a-:
+
+
 def _sse_event(event_type: str, data: dict[str, Any]) -> str:
-    """Format a single SSE message."""
-    return f"event: {event_type}\n {json.dumps(data, ensure_ascii=False)}\n\n"
+    return f"event: {event_type}\n{_SSE_DATA_PREFIX} {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +183,25 @@ _BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["action"],
         },
     },
+    "execute_office_js": {
+        "type": "function",
+        "name": "execute_office_js",
+        "description": (
+            "Execute Office JavaScript (Office.js) API code in the context of a Microsoft Office "
+            "application. Use this to interact with Word, Excel, PowerPoint, or other Office host "
+            "applications via the Office.js API."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The Office JavaScript code to execute.",
+                },
+            },
+            "required": ["code"],
+        },
+    },
 }
 
 
@@ -194,7 +216,20 @@ def _builtin_tool_canonical_name(ttype: str) -> str | None:
         return "str_replace_based_edit_tool"
     if ttype.startswith("computer_"):
         return "computer"
+    if ttype.startswith("execute_office_js_"):
+        return "execute_office_js"
+    # Also handle the bare name without version suffix
+    if ttype == "execute_office_js":
+        return "execute_office_js"
     return None
+
+
+# Maps tool name → canonical schema key for tools that arrive with type='custom'.
+# Some environments (e.g. Outlook add-in) send execute_office_js with type='custom'
+# instead of type='execute_office_js_*'.
+_CUSTOM_TYPE_NAME_MAP: dict[str, str] = {
+    "execute_office_js": "execute_office_js",
+}
 
 
 def _is_known_builtin_tool(tool: Any) -> bool:
@@ -202,7 +237,14 @@ def _is_known_builtin_tool(tool: Any) -> bool:
     t = _tool_type(tool)
     if t is None:
         return False
-    return _builtin_tool_canonical_name(t) is not None
+    if _builtin_tool_canonical_name(t) is not None:
+        return True
+    # Also handle tools that use type='custom' with a known name
+    if t == "custom":
+        name = tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)
+        if name and name in _CUSTOM_TYPE_NAME_MAP:
+            return True
+    return False
 
 
 def _check_unsupported_tools(request: MessagesRequest) -> JSONResponse | None:
@@ -222,7 +264,9 @@ def _check_unsupported_tools(request: MessagesRequest) -> JSONResponse | None:
         tool_name = (
             tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", "unknown")
         )
-        if ttype and ttype != "function" and not _is_web_search_tool(tool) and not _is_known_builtin_tool(tool):
+        # Allow: no type, 'function', 'custom' (Office add-in / generic custom tools),
+        # web_search_* (handled by agentic loop), and known Claude Code builtins.
+        if ttype and ttype not in ("function", "custom") and not _is_web_search_tool(tool) and not _is_known_builtin_tool(tool):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -259,6 +303,10 @@ def _convert_builtin_tools(request: MessagesRequest) -> tuple[MessagesRequest, b
         ttype = _tool_type(tool)
         if ttype and _is_known_builtin_tool(tool):
             canonical = _builtin_tool_canonical_name(ttype)
+            # Fall back to name-based lookup for type='custom' tools
+            if canonical is None and ttype == "custom":
+                name = tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)
+                canonical = _CUSTOM_TYPE_NAME_MAP.get(name or "")
             if canonical and canonical not in seen_canonical:
                 schema = _BUILTIN_TOOL_SCHEMAS[canonical]
                 converted_tools.append(schema)
@@ -453,7 +501,7 @@ async def _run_web_search_agentic_loop(
         payload = openai_req.model_dump(exclude_none=True)
         payload["stream"] = False
 
-        oai_response = await forward_request(upstream_url, headers, payload, read_timeout=read_timeout, request_id=request_id)
+        oai_response = await stream_to_completion(upstream_url, headers, payload, read_timeout=read_timeout, request_id=request_id)
         anthropic_response = openai_to_anthropic_response(oai_response, current_request)
 
         content_blocks = anthropic_response.get("content", [])
@@ -727,9 +775,10 @@ async def create_message(
             },
         )
 
-    # Non-streaming standard path
+    # Non-streaming standard path — use stream_to_completion to avoid IBM ICA's
+    # ~180 s gateway timeout that silently returns HTTP 404 on long non-streaming requests.
     try:
-        oai_response = await forward_request(
+        oai_response = await stream_to_completion(
             upstream_url, headers, payload,
             read_timeout=settings.upstream_read_timeout,
             request_id=rid,
