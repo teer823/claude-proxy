@@ -6,6 +6,7 @@ import uuid
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -26,6 +27,8 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     # Timeout settings
     upstream_read_timeout: float = 300.0  # seconds to wait for upstream to respond/stream
+    # Proxy authentication (for non-localhost access, e.g. via ngrok)
+    proxy_api_key: str = ""  # when set, non-localhost requests must supply this key
     # Debug logging
     debug_mode: bool = False  # set DEBUG_MODE=true to enable request/response file logging
     debug_log_dir: str = "logs"  # directory where daily debug logs are written
@@ -99,10 +102,23 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Allow all origins so that browser-based clients and Claude Code can reach the
+# proxy without CORS preflight failures.  OPTIONS requests will now return 200
+# with the appropriate Access-Control-* headers instead of 405.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Register routers
 from routers.messages import router as messages_router  # noqa: E402
+from routers.models import router as models_router  # noqa: E402
 
 app.include_router(messages_router)
+app.include_router(models_router)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +228,81 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
 if settings.debug_mode:
     app.add_middleware(DebugLoggingMiddleware)
     logger.info("DebugLoggingMiddleware registered.")
+
+
+# ---------------------------------------------------------------------------
+# API-key enforcement middleware
+# Requests from localhost are always allowed.
+# Requests from other origins (e.g. via ngrok) must supply
+#   Authorization: Bearer <PROXY_API_KEY>
+# Only active when PROXY_API_KEY is non-empty.
+# ---------------------------------------------------------------------------
+
+_LOCALHOST_IPS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+# Paths that are always public (health probe used by orchestrators).
+_PUBLIC_PATHS = {"/health"}
+
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Enforce a static API key for non-localhost clients."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        required_key = settings.proxy_api_key
+        # Feature disabled — let everything through.
+        if not required_key:
+            return await call_next(request)
+
+        # Always allow health-check probes regardless of origin.
+        if request.url.path in _PUBLIC_PATHS:
+            return await call_next(request)
+
+        # Determine the real client IP.
+        # ngrok (and most reverse proxies) set X-Forwarded-For.
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            client_ip = xff.split(",")[0].strip()
+        else:
+            client_ip = (request.client.host if request.client else "") or ""
+
+        # Localhost → no key required.
+        if client_ip in _LOCALHOST_IPS:
+            return await call_next(request)
+
+        # Non-localhost → validate key.
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            provided_key = auth_header[len("Bearer "):]
+        elif request.headers.get("x-api-key", ""):
+            provided_key = request.headers.get("x-api-key", "")
+        else:
+            provided_key = ""
+
+        if provided_key != required_key:
+            logger.warning(
+                "Rejected unauthenticated request from %s %s %s",
+                client_ip,
+                request.method,
+                request.url.path,
+            )
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "authentication_error",
+                        "message": "Invalid API key supplied in Authorization header.",
+                    },
+                },
+            )
+
+        return await call_next(request)
+
+
+if settings.proxy_api_key:
+    app.add_middleware(ApiKeyMiddleware)
+    logger.info("ApiKeyMiddleware registered — non-localhost requests require a valid API key.")
+else:
+    logger.info("ApiKeyMiddleware disabled — PROXY_API_KEY is not set.")
 
 
 # ---------------------------------------------------------------------------
