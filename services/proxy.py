@@ -239,6 +239,67 @@ async def stream_request(
         log_upstream_response(debug_log, request_id, 200, chunks_for_log, is_streaming=True)
 
 
+async def strip_thinking_segment(
+    chunks: AsyncIterator[dict[str, Any]],
+) -> AsyncIterator[dict[str, Any]]:
+    """Filter out the leaked extended-thinking prefix from an ICA chunk stream.
+
+    IBM ICA's *streaming* endpoint leaks the model's extended-thinking text as
+    ordinary content deltas, followed by exactly one empty-content delta that
+    separates the thinking from the real answer.  (The non-streaming endpoint
+    strips thinking server-side; the streaming one forgets to.)
+
+    Strategy: withhold plain-text content deltas until the empty separator
+    chunk is seen, then drop the withheld thinking and pass the rest through.
+    If the stream ends without a separator (i.e. there was no thinking), flush
+    the withheld text as one synthetic chunk so no output is ever lost.
+    Chunks carrying tool calls or other non-text deltas always pass through.
+    """
+    withheld: list[str] = []
+    template: dict[str, Any] | None = None
+    seen_separator = False
+
+    try:
+        async for chunk in chunks:
+            if seen_separator:
+                yield chunk
+                continue
+
+            choices = chunk.get("choices") or []
+            delta = (choices[0].get("delta") or {}) if choices else {}
+            finish = choices[0].get("finish_reason") if choices else None
+            content = delta.get("content")
+            has_extra = any(v for k, v in delta.items() if k not in ("content", "role"))
+
+            if content == "" and not has_extra and not finish:
+                # The separator between thinking and answer — drop the thinking.
+                logger.debug("Dropped leaked thinking segment (%d chars)", sum(len(t) for t in withheld))
+                withheld = []
+                seen_separator = True
+                continue
+
+            if content and not has_extra and not finish:
+                withheld.append(content)
+                template = chunk
+                continue
+
+            if withheld and (finish or has_extra):
+                # Stream is ending (or switching to tool calls) with no separator
+                # seen — the withheld text was the real answer, not thinking.
+                flush = json.loads(json.dumps(template))
+                flush["choices"][0]["delta"] = {"role": "assistant", "content": "".join(withheld)}
+                flush["choices"][0]["finish_reason"] = None
+                withheld = []
+                seen_separator = True
+                yield flush
+
+            yield chunk
+    finally:
+        aclose = getattr(chunks, "aclose", None)
+        if aclose:
+            await aclose()
+
+
 async def stream_to_completion(
     url: str,
     headers: dict[str, str],
@@ -268,9 +329,9 @@ async def stream_to_completion(
     text_parts: list[str] = []
     tool_calls_by_index: dict[int, dict[str, Any]] = {}
 
-    async for chunk in stream_request(
+    async for chunk in strip_thinking_segment(stream_request(
         url, headers, stream_payload, read_timeout=read_timeout, request_id=request_id
-    ):
+    )):
         response_id = response_id or chunk.get("id")
         model = chunk.get("model") or model
         created = chunk.get("created") or created

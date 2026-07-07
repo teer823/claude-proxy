@@ -13,7 +13,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from schemas.anthropic import MessagesRequest
-from services.proxy import forward_request, stream_request, stream_to_completion
+from services.proxy import forward_request, stream_request, stream_to_completion, strip_thinking_segment
 from services.translator import (
     anthropic_to_openai_request,
     openai_stream_to_anthropic_events,
@@ -355,11 +355,11 @@ async def _stream_anthropic_events(
     # Without this, Python's async-generator finalizer may schedule aclose()
     # while the generator coroutine is still on the call stack, producing:
     #   RuntimeError: aclose(): asynchronous generator is already running
-    inner = stream_request(
+    inner = strip_thinking_segment(stream_request(
         upstream_url, headers, payload,
         read_timeout=read_timeout,
         request_id=request_id,
-    )
+    ))
     try:
         async for chunk in inner:
             events, block_index, sent_message_start, sent_content_block_start, accumulated_text, usage_data = (
