@@ -710,6 +710,11 @@ async def create_message(
 
     settings = _get_settings()
     target_model = settings.default_model
+    # Claude Code sends haiku-class model names for cheap background chores
+    # (conversation titles, summarization). Route them to SMALL_MODEL when
+    # configured instead of burning the big default model on utility calls.
+    if settings.small_model and "haiku" in (request.model or "").lower():
+        target_model = settings.small_model
     logger.debug(
         "[%s] target_model=%r has_web_search=%s",
         rid,
