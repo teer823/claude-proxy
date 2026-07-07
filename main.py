@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
 
@@ -327,9 +328,52 @@ else:
 # ---------------------------------------------------------------------------
 
 
+# Anthropic clients (Claude Code included) parse errors in the shape
+#   {"type": "error", "error": {"type": "<error_type>", "message": "..."}}
+# and key their retry behavior off error.type — e.g. rate_limit_error and
+# overloaded_error are retried with backoff, invalid_request_error is not.
+# FastAPI's default {"detail": ...} shape shows up as an opaque JSON blob in
+# the client, so every error path is normalized here.
+_STATUS_TO_ANTHROPIC_ERROR_TYPE = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+    500: "api_error",
+    502: "api_error",
+    503: "overloaded_error",
+    504: "api_error",
+    529: "overloaded_error",
+}
+
+
+def _anthropic_error_response(status_code: int, message: str) -> JSONResponse:
+    """Build an Anthropic-format error response for the given HTTP status."""
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {
+                "type": _STATUS_TO_ANTHROPIC_ERROR_TYPE.get(status_code, "api_error"),
+                "message": message,
+            },
+        },
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Convert HTTPExceptions (incl. proxied upstream errors) to Anthropic error format."""
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    return _anthropic_error_response(exc.status_code, detail)
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """Log FastAPI request validation errors (422) so they appear in the application log."""
+    """Log FastAPI request validation errors (422) and return them in Anthropic format."""
     body = None
     try:
         body = await request.json()
@@ -342,7 +386,18 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         exc.errors(),
         body,
     )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    # Summarize the first validation error as a human-readable message,
+    # e.g. "messages.1.role: Input should be 'user' or 'assistant'"
+    errors = exc.errors()
+    if errors:
+        first = errors[0]
+        loc = ".".join(str(part) for part in first.get("loc", []) if part != "body")
+        message = f"{loc}: {first.get('msg', 'invalid request')}" if loc else first.get("msg", "invalid request")
+        if len(errors) > 1:
+            message += f" (+{len(errors) - 1} more validation errors)"
+    else:
+        message = "Invalid request"
+    return _anthropic_error_response(422, message)
 
 
 # ---------------------------------------------------------------------------
