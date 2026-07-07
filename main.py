@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     # haiku-class model names for chores like conversation-title generation;
     # when set, those requests route here instead of default_model.
     small_model: str = ""
+    # Use XML tool-call mode from the first request instead of native OpenAI
+    # function calling. Required for IBM ICA, which silently strips the `tools`
+    # parameter — the model never sees tool definitions, so native calls can
+    # never happen. Set false for upstreams with working native tool support.
+    force_xml_tools: bool = True
     # Web search tool settings
     web_search_provider: str = "duckduckgo"  # "duckduckgo" or "tavily"
     tavily_api_key: str = ""

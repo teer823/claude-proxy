@@ -532,6 +532,7 @@ def _build_tool_result_content(block: Any) -> str:
 def anthropic_to_openai_request(
     request: MessagesRequest,
     target_model: str,
+    force_xml_tools: bool = False,
 ) -> ChatCompletionRequest:
     """Convert an Anthropic MessagesRequest to an OpenAI ChatCompletionRequest.
 
@@ -541,8 +542,13 @@ def anthropic_to_openai_request(
       2. Re-render tool_use blocks as XML text in assistant turns.
       3. Re-render tool_result blocks as XML result text in user turns.
       4. Do NOT send the 'tools' or 'tool_choice' fields to the upstream.
+
+    ``force_xml_tools`` enables XML mode from the very first request. Required
+    for upstreams that silently strip the native ``tools`` parameter (IBM ICA
+    does — the model never sees the definitions, so the first tool call can
+    never happen and the conversation-content heuristic never triggers).
     """
-    xml_mode = _is_xml_mode(request)
+    xml_mode = force_xml_tools or _is_xml_mode(request)
 
     # Build system prompt
     system_text = _get_system_text(request.system) or ""
