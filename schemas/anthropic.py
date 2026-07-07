@@ -52,7 +52,10 @@ ContentBlock = Union[
 
 
 class Message(BaseModel):
-    role: Literal["user", "assistant"]
+    # Anthropic's spec only allows user/assistant here, but newer Claude Code
+    # versions send system-role messages in the array; pass them through since
+    # the OpenAI side accepts role="system" natively.
+    role: Literal["user", "assistant", "system"]
     content: Union[str, list[ContentBlock]]
 
 
