@@ -1,7 +1,10 @@
 """Async HTTP proxy service — forwards requests to the OpenAI-compatible backend."""
 
+from __future__ import annotations
+
 import json
 import logging
+import uuid
 from typing import Any, AsyncIterator
 
 import httpx
@@ -234,3 +237,103 @@ async def stream_request(
     if debug_log and request_id and chunks_for_log:
         from services.debug_logger import log_upstream_response
         log_upstream_response(debug_log, request_id, 200, chunks_for_log, is_streaming=True)
+
+
+async def stream_to_completion(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    read_timeout: float = 300.0,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Send the request as a *streaming* call and assemble the SSE chunks into
+    a complete non-streaming ChatCompletion response dict.
+
+    Used on logically non-streaming paths: IBM ICA's gateway silently drops
+    long non-streaming requests (~180 s, returning HTTP 404), but a streaming
+    connection stays alive because bytes keep flowing.
+
+    ``read_timeout`` and ``request_id`` are passed through to ``stream_request``.
+    """
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+
+    rid_tag = f"[{request_id}] " if request_id else ""
+
+    response_id: str | None = None
+    model: str | None = None
+    created: int | None = None
+    finish_reason: str | None = None
+    usage: dict[str, Any] = {}
+    text_parts: list[str] = []
+    tool_calls_by_index: dict[int, dict[str, Any]] = {}
+
+    async for chunk in stream_request(
+        url, headers, stream_payload, read_timeout=read_timeout, request_id=request_id
+    ):
+        response_id = response_id or chunk.get("id")
+        model = chunk.get("model") or model
+        created = chunk.get("created") or created
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+
+        # Standard streams put deltas under "delta"; some upstreams send the
+        # whole message in a single chunk under "message".
+        delta = choice.get("delta") or choice.get("message") or {}
+
+        content = delta.get("content")
+        if content:
+            text_parts.append(content)
+
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            entry = tool_calls_by_index.setdefault(idx, {
+                "id": None,
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if tc.get("id"):
+                entry["id"] = tc["id"]
+            func = tc.get("function") or {}
+            if func.get("name"):
+                entry["function"]["name"] += func["name"]
+            if func.get("arguments"):
+                entry["function"]["arguments"] += func["arguments"]
+
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(text_parts),
+    }
+    if tool_calls_by_index:
+        tool_calls = []
+        for idx in sorted(tool_calls_by_index):
+            entry = tool_calls_by_index[idx]
+            if not entry["id"]:
+                entry["id"] = f"call_{uuid.uuid4().hex[:24]}"
+            tool_calls.append(entry)
+        message["tool_calls"] = tool_calls
+
+    logger.debug(
+        "%sassembled stream into completion: text_len=%d tool_calls=%d finish_reason=%s",
+        rid_tag, len(message["content"]), len(tool_calls_by_index), finish_reason,
+    )
+
+    return {
+        "id": response_id or f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason or "stop",
+        }],
+        "usage": usage,
+    }

@@ -1,5 +1,7 @@
 """Router for the Anthropic Messages API endpoint."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
