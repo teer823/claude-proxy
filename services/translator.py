@@ -461,7 +461,9 @@ def _anthropic_content_to_openai(
                 data = source.get("data", "")
                 openai_content_parts.append({
                     "type": "image_url",
-                    "image_url": {"url": f"{media_type};base64,{data}"},
+                    # RFC 2397 data URI: the "data:" scheme prefix is required —
+                    # without it upstreams reject or silently drop the image.
+                    "image_url": {"url": f"data:{media_type};base64,{data}"},
                 })
             elif src_type == "url":
                 openai_content_parts.append({
