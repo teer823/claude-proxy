@@ -147,6 +147,108 @@ async def forward_request(
         return data
 
 
+async def stream_to_completion(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    read_timeout: float = 300.0,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Send a request to the upstream using streaming and assemble a complete
+    OpenAI-style ChatCompletion response dict.
+
+    This avoids IBM ICA's ~180 s gateway timeout that silently returns HTTP 404
+    on long-running non-streaming requests: by forcing ``stream=true`` the TCP
+    connection stays alive with SSE chunks flowing through the gateway regardless
+    of how long the model takes to generate a response.
+
+    The returned dict has the same shape as ``forward_request()`` so callers can
+    swap one for the other transparently.
+    """
+    # Always force streaming on the upstream call.
+    streaming_payload = {**payload, "stream": True}
+
+    rid_tag = f"[{request_id}] " if request_id else ""
+    logger.debug("%supstream → POST %s (stream_to_completion)", rid_tag, url)
+
+    # Accumulated response state
+    message_id: str = ""
+    role: str = "assistant"
+    finish_reason: str | None = None
+    # text content is built by concatenating text deltas
+    content_text: str = ""
+    # tool calls: keyed by index, value is a mutable dict
+    tool_calls_map: dict[int, dict[str, Any]] = {}
+    usage: dict[str, Any] = {}
+    model: str = ""
+
+    async for chunk in stream_request(
+        url, headers, streaming_payload,
+        read_timeout=read_timeout,
+        request_id=request_id,
+    ):
+        if not message_id:
+            message_id = chunk.get("id", "")
+        if not model:
+            model = chunk.get("model", "")
+
+        for choice in chunk.get("choices", []):
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+
+            delta = choice.get("delta", {})
+
+            # Text content
+            if delta.get("content"):
+                content_text += delta["content"]
+
+            # Tool calls
+            for tc in delta.get("tool_calls", []):
+                idx = tc.get("index", 0)
+                if idx not in tool_calls_map:
+                    tool_calls_map[idx] = {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                entry = tool_calls_map[idx]
+                if tc.get("id"):
+                    entry["id"] = tc["id"]
+                if tc.get("type"):
+                    entry["type"] = tc["type"]
+                fn = tc.get("function", {})
+                if fn.get("name"):
+                    entry["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    entry["function"]["arguments"] += fn["arguments"]
+
+        # Usage is typically in the last chunk
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+
+    # Build a synthetic ChatCompletion response dict
+    message: dict[str, Any] = {"role": role, "content": content_text or None}
+    if tool_calls_map:
+        message["tool_calls"] = [tool_calls_map[i] for i in sorted(tool_calls_map)]
+
+    response_dict: dict[str, Any] = {
+        "id": message_id,
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": usage,
+    }
+
+    logger.debug("%supstream stream_to_completion done finish_reason=%s", rid_tag, finish_reason)
+    return response_dict
+
+
 async def stream_request(
     url: str,
     headers: dict[str, str],

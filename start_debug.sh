@@ -30,4 +30,5 @@ exec .venv/bin/uvicorn main:app \
   --host 0.0.0.0 \
   --port 8082 \
   --reload \
+  --reload-exclude "${DEBUG_LOG_DIR:-logs}/*" \
   --log-level debug
