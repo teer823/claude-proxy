@@ -808,7 +808,9 @@ async def create_message(
         return JSONResponse(content=final_response)
 
     # --- Standard proxy path ---
-    openai_request = anthropic_to_openai_request(request, target_model)
+    openai_request = anthropic_to_openai_request(
+        request, target_model, force_xml_tools=settings.force_xml_tools
+    )
     payload = openai_request.model_dump(exclude_none=True)
 
     if request.stream:
