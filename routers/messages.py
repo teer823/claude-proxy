@@ -623,6 +623,52 @@ async def _stream_from_anthropic_response(
 
 
 # ---------------------------------------------------------------------------
+# Token counting endpoint
+# ---------------------------------------------------------------------------
+
+# Rough chars-per-token ratio for estimation. Claude/GPT tokenizers average
+# ~3.5-4 chars per token on English text and code; 4 keeps the estimate
+# conservative (slightly low) so clients trim context a little early rather
+# than overflow the upstream limit.
+_CHARS_PER_TOKEN = 4
+
+
+@router.post("/v1/messages/count_tokens")
+async def count_tokens(http_request: Request) -> dict[str, Any]:
+    """Estimate the input token count for a Messages API request.
+
+    Anthropic clients (Claude Code included) call this endpoint to decide when
+    to compact or trim conversation context. Without it the proxy returns 404
+    and clients fall back to guessing. The upstream is an arbitrary
+    OpenAI-compatible model with no tokenizer available here, so this returns
+    a character-based estimate rather than an exact count — good enough for
+    context-window management, not for billing.
+
+    Parsed leniently (raw JSON, not the MessagesRequest schema) because
+    count_tokens payloads omit fields that are required for /v1/messages,
+    e.g. max_tokens.
+    """
+    try:
+        body = await http_request.json()
+    except Exception:
+        return {"input_tokens": 0}
+
+    total_chars = 0
+    for key in ("messages", "system", "tools"):
+        value = body.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            total_chars += len(value)
+        else:
+            # Serialized JSON length approximates the prompt-rendered size of
+            # structured content (content blocks, tool schemas) well enough.
+            total_chars += len(json.dumps(value, ensure_ascii=False))
+
+    return {"input_tokens": max(1, total_chars // _CHARS_PER_TOKEN)}
+
+
+# ---------------------------------------------------------------------------
 # Main endpoint
 # ---------------------------------------------------------------------------
 
