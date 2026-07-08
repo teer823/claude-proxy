@@ -249,41 +249,38 @@ def _is_known_builtin_tool(tool: Any) -> bool:
     return False
 
 
-def _check_unsupported_tools(request: MessagesRequest) -> JSONResponse | None:
-    """Return a 400 error if any truly unsupported built-in Anthropic tools are present.
+def _strip_unsupported_tools(request: MessagesRequest) -> tuple[MessagesRequest, list[str]]:
+    """Drop built-in Anthropic tools the proxy cannot convert, instead of failing.
 
-    Allowed through:
-      - type is None or 'function'  (standard custom tools)
+    Kept:
+      - type is None, 'function', or 'custom'  (standard custom tools)
       - type starts with 'web_search'  (handled by proxy agentic loop)
       - type is a known Claude Code built-in (bash_*, text_editor_*, etc.) — converted by
         _convert_builtin_tools() before forwarding to upstream
-    All other non-function built-in types are rejected with 400.
+    Anything else (e.g. new built-in tool types added by newer Claude Code releases)
+    is removed from the request so the rest of the session keeps working; the model
+    simply never sees the tool.  Returns (request, descriptions_of_stripped_tools).
     """
     if not request.tools:
-        return None
+        return request, []
+    stripped: list[str] = []
+    kept: list[Any] = []
     for tool in request.tools:
         ttype = _tool_type(tool)
-        tool_name = (
-            tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", "unknown")
-        )
-        # Allow: no type, 'function', 'custom' (Office add-in / generic custom tools),
+        # Keep: no type, 'function', 'custom' (Office add-in / generic custom tools),
         # web_search_* (handled by agentic loop), and known Claude Code builtins.
         if ttype and ttype not in ("function", "custom") and not _is_web_search_tool(tool) and not _is_known_builtin_tool(tool):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "code": "unsupported_feature",
-                        "message": (
-                            f"Built-in Anthropic tool '{tool_name}' (type='{ttype}') "
-                            "is not supported by this proxy."
-                        ),
-                    },
-                },
+            tool_name = (
+                tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", "unknown")
             )
-    return None
+            stripped.append(f"{tool_name} (type={ttype})")
+        else:
+            kept.append(tool)
+    if not stripped:
+        return request, []
+    data = request.model_dump()
+    data["tools"] = [t if isinstance(t, dict) else t.model_dump() for t in kept]
+    return MessagesRequest(**data), stripped
 
 
 def _convert_builtin_tools(request: MessagesRequest) -> tuple[MessagesRequest, bool]:
@@ -735,10 +732,17 @@ async def create_message(
         msg_count,
     )
 
-    if (error_response := _check_unsupported_tools(request)) is not None:
-        elapsed = time.monotonic() - start_time
-        logger.info("[%s] ← 400 unsupported_tool duration=%.2fs", rid, elapsed)
-        return error_response
+    # Newer Claude Code releases may send built-in tool types this proxy does not
+    # know how to convert (e.g. advisor_20260301).  Strip them and continue rather
+    # than failing the whole request.
+    request, stripped_tools = _strip_unsupported_tools(request)
+    if stripped_tools:
+        logger.warning(
+            "[%s] stripped %d unsupported built-in tool(s): %s",
+            rid,
+            len(stripped_tools),
+            ", ".join(stripped_tools),
+        )
 
     # Convert Claude Code built-in tools (bash_*, text_editor_*, etc.) to function tools
     request, _ = _convert_builtin_tools(request)
