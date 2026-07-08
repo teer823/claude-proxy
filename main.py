@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://sg.ica.ibm.com/ica/apis/v3"
     openai_api_key: str = "your-api-key-here"
     default_model: str = "global/anthropic.claude-sonnet-4-6"
+    # Optional cheaper model for background/utility requests. Claude Code sends
+    # haiku-class model names for chores like conversation-title generation;
+    # when set, those requests route here instead of default_model.
+    small_model: str = ""
     # Web search tool settings
     web_search_provider: str = "duckduckgo"  # "duckduckgo" or "tavily"
     tavily_api_key: str = ""

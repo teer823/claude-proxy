@@ -729,6 +729,10 @@ def anthropic_to_openai_request(
         top_p=request.top_p,
         stop=request.stop_sequences,
         stream=request.stream,
+        # Ask streaming upstreams to emit a final usage chunk so real token
+        # counts can be reported to the client; ignored by upstreams that
+        # don't support it (the estimation fallback covers those).
+        stream_options={"include_usage": True} if request.stream else None,
         tools=openai_tools,
         tool_choice=tool_choice,
         # thinking is intentionally NOT forwarded — IBM ICA does not support it
@@ -846,6 +850,17 @@ def openai_to_anthropic_response(
 # OpenAI streaming chunk -> Anthropic SSE events
 # ---------------------------------------------------------------------------
 
+def _count_text_delta_chars(events: list[dict[str, Any]]) -> int:
+    """Sum the character length of all text_delta events in a batch."""
+    total = 0
+    for evt in events:
+        if evt.get("type") == "content_block_delta":
+            delta = evt.get("delta", {})
+            if delta.get("type") == "text_delta":
+                total += len(delta.get("text", ""))
+    return total
+
+
 def openai_stream_to_anthropic_events(
     chunk: dict[str, Any],
     message_id: str,
@@ -856,6 +871,7 @@ def openai_stream_to_anthropic_events(
     sent_content_block_start: dict[int, bool],
     accumulated_text: str = "",
     usage_data: Optional[dict[str, Any]] = None,
+    input_tokens_estimate: int = 0,
 ) -> tuple[list[dict[str, Any]], int, bool, dict[int, bool], str, dict[str, Any]]:
     """Convert a single OpenAI streaming chunk to Anthropic SSE event dicts.
 
@@ -1130,11 +1146,30 @@ def openai_stream_to_anthropic_events(
             events.append({"type": "content_block_stop", "index": idx})
 
         stop_reason = _openai_finish_reason_to_anthropic(finish_reason)
+        # Estimation fallback: when the upstream never sent a usage chunk
+        # (all-zero usage_data), report chars/4 estimates instead of zeros so
+        # clients' token displays and context accounting stay meaningful.
+        # Streamed output size comes from the private running counter (plus
+        # any text flushed in this final call) — accumulated_text can't be
+        # used because the XML-detection paths reset it mid-stream.
+        streamed_chars = usage_data.pop("_streamed_chars", 0) + _count_text_delta_chars(events)
+        if not usage_data.get("input_tokens") and not usage_data.get("output_tokens"):
+            usage_data["input_tokens"] = input_tokens_estimate
+            usage_data["output_tokens"] = max(1, streamed_chars // 4)
         events.append({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": usage_data,
         })
         events.append({"type": "message_stop"})
+
+    # Maintain the running streamed-output counter for the estimation fallback.
+    # Skipped once the final message_delta has been emitted (its usage dict is
+    # this same object by reference — mutating it afterwards would leak the
+    # private key into the serialized event).
+    if not any(e.get("type") == "message_stop" for e in events):
+        chars = _count_text_delta_chars(events)
+        if chars:
+            usage_data["_streamed_chars"] = usage_data.get("_streamed_chars", 0) + chars
 
     return events, block_index, sent_message_start, sent_content_block_start, accumulated_text, usage_data

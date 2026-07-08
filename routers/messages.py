@@ -347,6 +347,11 @@ async def _stream_anthropic_events(
     sent_content_block_start: dict[int, bool] = {}
     accumulated_text = ""
     usage_data: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0}
+    # chars/4 estimate of the input size, used as fallback when the upstream
+    # stream never emits a usage chunk (see translator estimation fallback).
+    input_tokens_estimate = max(
+        1, len(json.dumps(payload.get("messages", []), ensure_ascii=False)) // 4
+    )
 
     yield _sse_event("ping", {"type": "ping"})
 
@@ -373,6 +378,7 @@ async def _stream_anthropic_events(
                     sent_content_block_start=sent_content_block_start,
                     accumulated_text=accumulated_text,
                     usage_data=usage_data,
+                    input_tokens_estimate=input_tokens_estimate,
                 )
             )
             for event in events:
@@ -505,6 +511,7 @@ async def _run_web_search_agentic_loop(
 
         oai_response = await stream_to_completion(upstream_url, headers, payload, read_timeout=read_timeout, request_id=request_id)
         anthropic_response = openai_to_anthropic_response(oai_response, current_request)
+        _ensure_usage_estimate(anthropic_response, payload)
 
         content_blocks = anthropic_response.get("content", [])
         web_search_calls = [
@@ -622,6 +629,34 @@ async def _stream_from_anthropic_response(
     yield _sse_event("message_stop", {"type": "message_stop"})
 
 
+def _ensure_usage_estimate(anthropic_response: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Fill all-zero usage with chars/4 estimates, in place.
+
+    Some upstreams (IBM ICA among them) never report token usage. Clients use
+    these numbers for context accounting and cost display, so an estimate is
+    more useful than a hardcoded zero. Real upstream numbers always win —
+    estimation only kicks in when both counts are zero/absent.
+    """
+    usage = anthropic_response.get("usage") or {}
+    if usage.get("input_tokens") or usage.get("output_tokens"):
+        return
+    input_est = max(
+        1, len(json.dumps(payload.get("messages", []), ensure_ascii=False)) // _CHARS_PER_TOKEN
+    )
+    output_chars = 0
+    for block in anthropic_response.get("content", []):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            output_chars += len(block.get("text", ""))
+        elif block.get("type") == "tool_use":
+            output_chars += len(json.dumps(block.get("input", {}), ensure_ascii=False))
+    anthropic_response["usage"] = {
+        "input_tokens": input_est,
+        "output_tokens": max(1, output_chars // _CHARS_PER_TOKEN),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Token counting endpoint
 # ---------------------------------------------------------------------------
@@ -710,6 +745,11 @@ async def create_message(
 
     settings = _get_settings()
     target_model = settings.default_model
+    # Claude Code sends haiku-class model names for cheap background chores
+    # (conversation titles, summarization). Route them to SMALL_MODEL when
+    # configured instead of burning the big default model on utility calls.
+    if settings.small_model and "haiku" in (request.model or "").lower():
+        target_model = settings.small_model
     logger.debug(
         "[%s] target_model=%r has_web_search=%s",
         rid,
@@ -840,6 +880,7 @@ async def create_message(
         raise
 
     anthropic_response = openai_to_anthropic_response(oai_response, request)
+    _ensure_usage_estimate(anthropic_response, payload)
     elapsed = time.monotonic() - start_time
     usage = anthropic_response.get("usage", {})
     logger.info(

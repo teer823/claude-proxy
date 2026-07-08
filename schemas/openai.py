@@ -46,6 +46,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     stop: Optional[Union[str, list[str]]] = None
     stream: Optional[bool] = False
+    # OpenAI spec: {"include_usage": true} makes streams emit a final usage
+    # chunk. Upstreams that don't support it are expected to ignore it.
+    stream_options: Optional[dict[str, Any]] = None
     tools: Optional[list[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict[str, Any]]] = None
     # Note: thinking is intentionally excluded — IBM ICA does not support it

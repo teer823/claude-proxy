@@ -318,6 +318,8 @@ async def stream_to_completion(
     """
     stream_payload = dict(payload)
     stream_payload["stream"] = True
+    # Ask for a final usage chunk; ignored by upstreams that don't support it.
+    stream_payload.setdefault("stream_options", {"include_usage": True})
 
     rid_tag = f"[{request_id}] " if request_id else ""
 
