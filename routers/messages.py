@@ -278,9 +278,7 @@ def _strip_unsupported_tools(request: MessagesRequest) -> tuple[MessagesRequest,
             kept.append(tool)
     if not stripped:
         return request, []
-    data = request.model_dump()
-    data["tools"] = [t if isinstance(t, dict) else t.model_dump() for t in kept]
-    return MessagesRequest(**data), stripped
+    return request.model_copy(update={"tools": kept}), stripped
 
 
 def _convert_builtin_tools(request: MessagesRequest) -> tuple[MessagesRequest, bool]:
