@@ -9,10 +9,35 @@ This lets you point **Claude Code** (or any Anthropic-compatible client) at your
 - Translates Anthropic ↔ OpenAI request/response formats in both directions
 - Supports **streaming** (SSE) and **non-streaming** responses
 - Handles Anthropic's built-in `web_search` tool via an internal agentic loop (DuckDuckGo or Tavily)
-- Supports **extended thinking** (`thinking: {type: "enabled", budget_tokens: N}`)
-- XML tool-call mode for upstreams that don't support native OpenAI function calling
+- **XML tool-call mode** (`FORCE_XML_TOOLS`, default on) — required for upstreams like IBM ICA that silently strip the native `tools` parameter; enables Claude Code tool use and MCP servers end-to-end
+- Filters leaked extended-thinking segments out of ICA streaming responses
+- Token usage reporting (real upstream numbers when available, chars/4 estimates otherwise) + `POST /v1/messages/count_tokens`
+- **`SMALL_MODEL` routing** — haiku-class background requests (conversation titles etc.) go to a cheaper model
+- Errors returned in Anthropic format so clients show readable messages and retry correctly
 - Debug logging mode with daily-rotating log files
 - Runs on **port 8082**
+
+---
+
+## 🎨 Designer Quick Install (macOS)
+
+Non-technical? This is your path — **one command in Terminal** sets up everything
+(proxy, `claude-ica` launcher, Claude Code, Figma + Atlassian connections), asks
+for your ICA API key once, then helps you design your own AI buddy's personality:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/teer823/claude-proxy/main/kit/install.sh | bash
+```
+
+You only need: an **IBMDT email** (= you already have ICA access — open the ICA
+website, log in, copy your API key), and about 5 minutes.
+
+After it finishes: open a **new** Terminal window, type `claude-ica`, then type
+`/mcp` once to log into Figma and Atlassian in your browser. That's it~
+
+- Re-running the installer is always safe — it doubles as repair/upgrade.
+- Redesign your buddy anytime: `bash ~/claude-proxy/kit/setup-buddy.sh`
+- Something acting weird? `claude-ica restart`
 
 ---
 
@@ -20,7 +45,7 @@ This lets you point **Claude Code** (or any Anthropic-compatible client) at your
 
 | | Mac | Windows |
 |---|---|---|
-| Python | 3.11+ via [python.org](https://www.python.org/downloads/) or `brew install python` | 3.11+ from [python.org](https://www.python.org/downloads/) |
+| Python | 3.9+ (macOS stock `python3` works) | 3.9+ from [python.org](https://www.python.org/downloads/) |
 | Git | `brew install git` or Xcode CLT | [git-scm.com](https://git-scm.com/download/win) |
 | Container runtime *(optional)* | [Podman Desktop](https://podman-desktop.io/) or Docker | [Podman Desktop](https://podman-desktop.io/) or Docker Desktop |
 
@@ -300,6 +325,8 @@ Create or edit `.claude/settings.json` in your home directory or project root:
 | `OPENAI_BASE_URL` | `https://sg.ica.ibm.com/ica/apis/v3` | OpenAI-compatible upstream base URL |
 | `OPENAI_API_KEY` | *(required)* | Bearer token for the upstream |
 | `DEFAULT_MODEL` | `global/anthropic.claude-sonnet-4-6` | Model name sent to upstream; overrides the client's requested model |
+| `SMALL_MODEL` | *(empty)* | Optional cheaper model for haiku-class background requests (e.g. `global/anthropic.claude-haiku-4-5-20251001-v1:0`); empty = everything uses `DEFAULT_MODEL` |
+| `FORCE_XML_TOOLS` | `true` | Inject tool definitions as XML in the system prompt (required for IBM ICA, which strips the native `tools` param). Set `false` for upstreams with working native function calling |
 | `WEB_SEARCH_PROVIDER` | `duckduckgo` | `duckduckgo` (no key needed) or `tavily` |
 | `TAVILY_API_KEY` | *(empty)* | Required when `WEB_SEARCH_PROVIDER=tavily` |
 | `UPSTREAM_READ_TIMEOUT` | `300.0` | Seconds to wait for upstream response/stream |
@@ -342,6 +369,10 @@ services/
 
 **Requests time out on large documents or long responses**
 - Increase `UPSTREAM_READ_TIMEOUT` in `.env` (e.g. `UPSTREAM_READ_TIMEOUT=600`)
+
+**Worked yesterday, now every request fails with API Error 500 (`PermissionError: Operation not permitted` in the log)**
+- A proxy process left running overnight can lose network access (macOS/MDM revokes it after sleep or a network change) while `/health` still responds
+- Fix: restart the proxy — `claude-ica restart` (or kill the `python main.py` process and start it again)
 
 **Enable debug logging to inspect raw requests and responses**
 - Set `DEBUG_MODE=true` in `.env` and restart the server
