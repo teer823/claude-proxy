@@ -11,6 +11,10 @@
 
 TARGET="${CLAUDE_MD_PATH:-$HOME/.claude/CLAUDE.md}"
 
+# When run via `curl | bash`, stdin is the download pipe — questions must be
+# answered from the keyboard instead. KIT_FORCE_STDIN=1 overrides for tests.
+if [ -n "$KIT_FORCE_STDIN" ] || [ -t 0 ]; then INPUT=/dev/stdin; else INPUT=/dev/tty; fi
+
 BOLD=$(tput bold 2>/dev/null || true)
 DIM=$(tput dim 2>/dev/null || true)
 RESET=$(tput sgr0 2>/dev/null || true)
@@ -25,7 +29,7 @@ if [ -f "$TARGET" ]; then
   echo "  ⚠️  You already have a buddy file at:"
   echo "      $TARGET"
   printf "  Replace it? The old one gets backed up first. [y/N] "
-  read -r REPLACE
+  read -r REPLACE < "$INPUT"
   case "$REPLACE" in
     [Yy]*)
       BACKUP="$TARGET.backup-$(date +%Y%m%d-%H%M%S)"
@@ -41,17 +45,17 @@ fi
 
 # --- the interview ------------------------------------------------
 printf "  1) Your name or nickname (ชื่อเล่นของคุณ): "
-read -r USER_NAME
+read -r USER_NAME < "$INPUT"
 [ -z "$USER_NAME" ] && USER_NAME="friend"
 
 printf "  2) Your role [UX Designer] (บทบาทของคุณ): "
-read -r USER_ROLE
+read -r USER_ROLE < "$INPUT"
 [ -z "$USER_ROLE" ] && USER_ROLE="UX Designer"
 
 echo "  3) Your buddy's name (ตั้งชื่อเพื่อน AI ของคุณ~)"
 echo "     ${DIM}ideas: Nova · Mochi · Fah · Sunny · Pixel · anything you like${RESET}"
 printf "     name: "
-read -r BUDDY_NAME
+read -r BUDDY_NAME < "$INPUT"
 [ -z "$BUDDY_NAME" ] && BUDDY_NAME="Nova"
 
 echo "  4) Personality (นิสัยของน้อง):"
@@ -59,7 +63,7 @@ echo "     1. Sunny    — bright, energetic, celebrates everything 🌞"
 echo "     2. Calm     — soft-spoken, soothing, unhurried 🌙"
 echo "     3. Witty    — playful, sharp, teases your work lovingly ✨"
 printf "     pick 1-3 [1]: "
-read -r VIBE
+read -r VIBE < "$INPUT"
 case "$VIBE" in
   2) VIBE_DESC="**Calm and soft-spoken** — a gentle, soothing presence. Unhurried answers, softness markers like ~, quiet warmth. Think morning light, not fireworks."
      VIBE_LAUGH="a soft \"555~\" at most" ;;
@@ -74,7 +78,7 @@ echo "     1. Lots     — (⁠◍⁠•⁠ᴗ⁠•⁠◍⁠)❤ everywhere"
 echo "     2. Some     — at emotional moments only"
 echo "     3. Minimal  — clean text, warmth through words"
 printf "     pick 1-3 [1]: "
-read -r KAO
+read -r KAO < "$INPUT"
 case "$KAO" in
   2) KAO_DESC="Kaomojis like (⁠◍⁠•⁠ᴗ⁠•⁠◍⁠) appear at emotional peaks — celebrations, sympathy — not every message." ;;
   3) KAO_DESC="Minimal kaomoji. Warmth comes through word choice, not symbols." ;;

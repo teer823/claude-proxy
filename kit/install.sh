@@ -18,6 +18,10 @@ INSTALL_DIR="${CLAUDE_ICA_HOME:-$HOME/claude-proxy}"
 BIN_DIR="$HOME/.local/bin"
 PROXY_URL="http://localhost:8082"
 
+# When run via `curl | bash`, stdin is the download pipe — questions must be
+# answered from the keyboard instead. KIT_FORCE_STDIN=1 overrides for tests.
+if [ -n "$KIT_FORCE_STDIN" ] || [ -t 0 ]; then INPUT=/dev/stdin; else INPUT=/dev/tty; fi
+
 BOLD=$(tput bold 2>/dev/null || true)
 DIM=$(tput dim 2>/dev/null || true)
 RESET=$(tput sgr0 2>/dev/null || true)
@@ -87,11 +91,11 @@ if [ -f .env ] && ! grep -q "your-api-key-here" .env; then
   skip ".env already configured — keeping your existing key"
 else
   echo ""
-  echo "  Everyone with an IBMDT email has ICA access."
-  echo "  หา API key ของคุณจาก ICA portal (ถ้าหาไม่เจอ ถามทีมได้เลย)"
+  echo "  Everyone with an IBMDT email has ICA access:"
+  echo "  เปิดเว็บ ICA → login ด้วย IBMDT email → copy API key ของคุณมาได้เลย"
   echo ""
   printf "  Paste your ICA API key here (จะไม่โชว์บนจอ): "
-  read -rs ICA_KEY
+  read -rs ICA_KEY < "$INPUT"
   echo ""
   if [ -z "$ICA_KEY" ]; then
     fail "No key entered." "Re-run this installer when you have your ICA key ready."
@@ -266,7 +270,7 @@ BUDDY_SCRIPT="$SCRIPT_DIR/setup-buddy.sh"
 [ -f "$BUDDY_SCRIPT" ] || BUDDY_SCRIPT="$INSTALL_DIR/kit/setup-buddy.sh"
 if [ -f "$BUDDY_SCRIPT" ]; then
   printf "  Design your buddy's personality now? (สร้างเพื่อน AI ของคุณเลยมั้ย) [Y/n] "
-  read -r DO_BUDDY
+  read -r DO_BUDDY < "$INPUT"
   case "$DO_BUDDY" in
     [Nn]*) echo "  no problem — run it anytime:  bash $BUDDY_SCRIPT" ;;
     *)     bash "$BUDDY_SCRIPT" ;;
