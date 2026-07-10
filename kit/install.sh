@@ -268,6 +268,15 @@ echo ""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 BUDDY_SCRIPT="$SCRIPT_DIR/setup-buddy.sh"
 [ -f "$BUDDY_SCRIPT" ] || BUDDY_SCRIPT="$INSTALL_DIR/kit/setup-buddy.sh"
+if [ ! -f "$BUDDY_SCRIPT" ]; then
+  # Running via `curl | bash` and the cloned repo doesn't carry kit/ yet —
+  # fetch the wizard from the kit's home (upstream first, fork fallback).
+  mkdir -p "$INSTALL_DIR/kit"
+  BUDDY_SCRIPT="$INSTALL_DIR/kit/setup-buddy.sh"
+  curl -fsSL "https://raw.githubusercontent.com/teer823/claude-proxy/main/kit/setup-buddy.sh" -o "$BUDDY_SCRIPT" 2>/dev/null \
+    || curl -fsSL "https://raw.githubusercontent.com/lukeatdesign/claude-proxy/feat/designer-kit/kit/setup-buddy.sh" -o "$BUDDY_SCRIPT" 2>/dev/null \
+    || rm -f "$BUDDY_SCRIPT"
+fi
 if [ -f "$BUDDY_SCRIPT" ]; then
   printf "  Design your buddy's personality now? (สร้างเพื่อน AI ของคุณเลยมั้ย) [Y/n] "
   read -r DO_BUDDY < "$INPUT"
