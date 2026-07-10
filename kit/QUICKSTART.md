@@ -44,10 +44,24 @@ git --version
 
 ### 🚑 Step 1 rescue guide (ถ้ามันงอแง — อาการยอดฮิตทั้งนั้น)
 
-**"The software could not be downloaded" / "not available from the update server"**
-→ Almost always the **VPN blocking Apple's servers**. Disconnect the VPN
-(or hop onto normal Wi-Fi / phone hotspot) *just for this step*, run
-`xcode-select --install` again, then reconnect the VPN afterwards.
+**"Can't install the software because it is not currently available from the Software Update server"**
+→ Two possible causes, try in order:
+
+1. **VPN blocking Apple's servers** — disconnect the VPN (or hop onto normal
+   Wi-Fi / phone hotspot) *just for this step*, run `xcode-select --install`
+   again, then reconnect the VPN afterwards.
+2. **Still failing off-VPN? Your Mac is company-managed** (Company Portal /
+   Intune) and its update catalog points at the company's server, which
+   doesn't carry these tools. The reliable bypass — download directly from
+   Apple instead:
+   - Go to **developer.apple.com/download/all** (sign in with any Apple ID —
+     free account is fine, your personal one works)
+   - Search **"Command Line Tools for Xcode"** → download the newest `.dmg`
+   - Open it and install like any normal app
+   - Verify with `git --version`
+
+⚠️ Note: **installing Homebrew won't fix this** — Homebrew itself needs these
+same tools underneath. Solve this step first; everything else follows.
 
 **No dialog appears at all**
 → Just run `git --version` — macOS offers to install the tools when anything
