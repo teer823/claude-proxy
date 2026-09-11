@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     # Debug logging
     debug_mode: bool = False  # set DEBUG_MODE=true to enable request/response file logging
     debug_log_dir: str = "logs"  # directory where daily debug logs are written
+    # ICA-2 backend (optional second upstream with limited tokens)
+    ica2_base_url: str = ""       # empty = ICA-2 disabled
+    ica2_api_key: str = ""
+    # Path to the JSON file containing the model routing table.
+    # The file maps client model ids to {backend, model} entries.
+    # Default: model_routing.json in the current working directory.
+    model_routing_file: str = "model_routing.json"
+    # Port the proxy listens on
+    proxy_port: int = 8082
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -106,10 +115,26 @@ if settings.debug_mode:
 # App
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Lifespan (startup / shutdown)
+# ---------------------------------------------------------------------------
+
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan handler — call POST /admin/refresh-models to populate the model registry."""
+    yield
+    # Shutdown — nothing to clean up
+
+
 app = FastAPI(
     title="Claude Code Proxy",
     description="Proxies Anthropic Messages API requests to an OpenAI-compatible endpoint.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Allow all origins so that browser-based clients and Claude Code can reach the
@@ -426,14 +451,16 @@ async def health_check() -> dict:
 
 if __name__ == "__main__":
     logger.info(
-        "Starting proxy on port 8082 — upstream: %s — model: %s",
+        "Starting proxy on port %d — upstream: %s — model: %s%s",
+        settings.proxy_port,
         settings.openai_base_url,
         settings.default_model,
+        f" | ica2: {settings.ica2_base_url}" if settings.ica2_base_url else "",
     )
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8082,
+        port=settings.proxy_port,
         reload=False,
         log_level="info",
     )

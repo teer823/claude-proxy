@@ -60,6 +60,81 @@ def _build_upstream_headers(api_key: str) -> dict[str, str]:
     }
 
 
+def _request_has_image(request: MessagesRequest) -> bool:
+    """Return True if any message in the request contains an image content block."""
+    for msg in request.messages:
+        content = msg.content if hasattr(msg, "content") else msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                btype = (
+                    block.get("type") if isinstance(block, dict)
+                    else getattr(block, "type", None)
+                )
+                if btype == "image":
+                    return True
+    return False
+
+
+def _load_routing_table(settings: Any) -> dict[str, Any]:
+    """Load the model routing table from the JSON file specified in settings.
+
+    Keys starting with ``_`` are treated as comments and ignored.
+    Returns an empty dict if the file is missing or invalid (non-fatal).
+    """
+    import os
+    path = getattr(settings, "model_routing_file", "model_routing.json")
+    if not os.path.isfile(path):
+        logger.debug("Model routing file not found: %s — no routing overrides applied", path)
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        # Strip comment keys (starting with "_")
+        return {k: v for k, v in data.items() if not k.startswith("_")}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to load model routing file %s: %s — falling back to no routing", path, exc)
+        return {}
+
+
+def _resolve_backend(
+    client_model: str,
+    settings: Any,
+) -> tuple[str, dict[str, str], str]:
+    """Resolve which backend to use for a given client model name.
+
+    Returns ``(upstream_url, headers, resolved_model_id)``.
+
+    Routing priority:
+    1. Look up ``client_model`` in routing table loaded from ``model_routing.json``.
+       - ``backend: "ica1"`` → ICA-1 URL + key, translated model id.
+       - ``backend: "ica2"`` → ICA-2 URL + key, translated model id.
+         (falls back to ICA-1 if ICA-2 is not configured)
+    2. Not in routing table → ICA-1 + ``DEFAULT_MODEL`` (original behaviour).
+    """
+    routing = _load_routing_table(settings)
+
+    entry = routing.get(client_model)
+    if entry and isinstance(entry, dict):
+        backend = entry.get("backend", "ica1")
+        resolved_model = entry.get("model") or settings.default_model
+        if backend == "ica2" and settings.ica2_base_url:
+            url = f"{settings.ica2_base_url.rstrip('/')}/chat/completions"
+            logger.debug(
+                "Routing model=%r → ica2 upstream_model=%r", client_model, resolved_model
+            )
+            return url, _build_upstream_headers(settings.ica2_api_key), resolved_model
+        # backend == "ica1" (or ica2 requested but not configured → fallback to ica1)
+        url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
+        logger.debug(
+            "Routing model=%r → ica1 upstream_model=%r", client_model, resolved_model
+        )
+        return url, _build_upstream_headers(settings.openai_api_key), resolved_model
+
+    # Not in routing table → ICA-1 default
+    url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
+    return url, _build_upstream_headers(settings.openai_api_key), settings.default_model
+
+
 # "" prefix built via chr() to survive markdown rendering of this source file.
 _SSE_DATA_PREFIX = chr(100) + chr(97) + chr(116) + chr(97) + chr(58)  # d-a-t-a-:
 
@@ -746,21 +821,44 @@ async def create_message(
     request, _ = _convert_builtin_tools(request)
 
     settings = _get_settings()
-    target_model = settings.default_model
+
+    # Determine the client-side model name to use for routing lookup.
     # Claude Code sends haiku-class model names for cheap background chores
     # (conversation titles, summarization). Route them to SMALL_MODEL when
     # configured instead of burning the big default model on utility calls.
+    routing_model = request.model or settings.default_model
     if settings.small_model and "haiku" in (request.model or "").lower():
-        target_model = settings.small_model
+        routing_model = settings.small_model
+
+    # --- Image-aware backend override ---
+    # ICA-1 does not support images. If the request contains image blocks, route
+    # to ICA-2's claude-sonnet-4-6 by default — unless the routing table already
+    # explicitly maps this request to a specific ICA-2 model (e.g. claude-sonnet-5,
+    # claude-opus-4-8), in which case that explicit mapping is respected.
+    has_image = _request_has_image(request)
+    _routing_table = _load_routing_table(settings)
+    _routing_entry = _routing_table.get(routing_model, {})
+    _already_ica2 = isinstance(_routing_entry, dict) and _routing_entry.get("backend") == "ica2"
+
+    if has_image and not _already_ica2 and settings.ica2_base_url:
+        upstream_url = f"{settings.ica2_base_url.rstrip('/')}/chat/completions"
+        headers = _build_upstream_headers(settings.ica2_api_key)
+        target_model = "claude-sonnet-4-6"
+        logger.info(
+            "[%s] image detected → overriding backend to ica2 model=claude-sonnet-4-6",
+            rid,
+        )
+    else:
+        upstream_url, headers, target_model = _resolve_backend(routing_model, settings)
+
     logger.debug(
-        "[%s] target_model=%r has_web_search=%s",
+        "[%s] target_model=%r upstream=%r has_image=%s has_web_search=%s",
         rid,
         target_model,
+        upstream_url,
+        has_image,
         bool(request.tools and any(_is_web_search_tool(t) for t in request.tools)),
     )
-
-    upstream_url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
-    headers = _build_upstream_headers(settings.openai_api_key)
 
     has_web_search = bool(
         request.tools and any(_is_web_search_tool(t) for t in request.tools)
