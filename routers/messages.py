@@ -117,13 +117,23 @@ def _resolve_backend(
     if entry and isinstance(entry, dict):
         backend = entry.get("backend", "ica1")
         resolved_model = entry.get("model") or settings.default_model
-        if backend == "ica2" and settings.ica2_base_url:
-            url = f"{settings.ica2_base_url.rstrip('/')}/chat/completions"
-            logger.debug(
-                "Routing model=%r → ica2 upstream_model=%r", client_model, resolved_model
+        if backend == "ica2":
+            if settings.ica2_base_url:
+                url = f"{settings.ica2_base_url.rstrip('/')}/chat/completions"
+                logger.debug(
+                    "Routing model=%r → ica2 upstream_model=%r", client_model, resolved_model
+                )
+                return url, _build_upstream_headers(settings.ica2_api_key), resolved_model
+            # ICA-2 requested but not configured → failover to ICA-1 default model
+            logger.warning(
+                "Routing model=%r requested ica2 backend but ICA2_BASE_URL is not configured "
+                "— falling back to ica1 default_model=%r",
+                client_model,
+                settings.default_model,
             )
-            return url, _build_upstream_headers(settings.ica2_api_key), resolved_model
-        # backend == "ica1" (or ica2 requested but not configured → fallback to ica1)
+            url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
+            return url, _build_upstream_headers(settings.openai_api_key), settings.default_model
+        # backend == "ica1"
         url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
         logger.debug(
             "Routing model=%r → ica1 upstream_model=%r", client_model, resolved_model
@@ -840,14 +850,24 @@ async def create_message(
     _routing_entry = _routing_table.get(routing_model, {})
     _already_ica2 = isinstance(_routing_entry, dict) and _routing_entry.get("backend") == "ica2"
 
-    if has_image and not _already_ica2 and settings.ica2_base_url:
-        upstream_url = f"{settings.ica2_base_url.rstrip('/')}/chat/completions"
-        headers = _build_upstream_headers(settings.ica2_api_key)
-        target_model = "claude-sonnet-4-6"
-        logger.info(
-            "[%s] image detected → overriding backend to ica2 model=claude-sonnet-4-6",
-            rid,
-        )
+    if has_image and not _already_ica2:
+        if settings.ica2_base_url:
+            upstream_url = f"{settings.ica2_base_url.rstrip('/')}/chat/completions"
+            headers = _build_upstream_headers(settings.ica2_api_key)
+            target_model = "claude-sonnet-4-6"
+            logger.info(
+                "[%s] image detected → overriding backend to ica2 model=claude-sonnet-4-6",
+                rid,
+            )
+        else:
+            # ICA-2 not configured — fall back to ICA-1 default model
+            logger.warning(
+                "[%s] image detected but ICA2_BASE_URL is not configured "
+                "— falling back to ica1 default_model=%r (images may not be supported)",
+                rid,
+                settings.default_model,
+            )
+            upstream_url, headers, target_model = _resolve_backend(routing_model, settings)
     else:
         upstream_url, headers, target_model = _resolve_backend(routing_model, settings)
 
