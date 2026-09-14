@@ -61,17 +61,28 @@ def _build_upstream_headers(api_key: str) -> dict[str, str]:
 
 
 def _request_has_image(request: MessagesRequest) -> bool:
-    """Return True if any message in the request contains an image content block."""
-    for msg in request.messages:
-        content = msg.content if hasattr(msg, "content") else msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                btype = (
-                    block.get("type") if isinstance(block, dict)
-                    else getattr(block, "type", None)
-                )
-                if btype == "image":
-                    return True
+    """Return True if the LAST user message contains an image content block.
+
+    Only the most recent user turn is checked — images in historical messages
+    have already been processed and should not affect backend routing for new turns.
+    """
+    last_user_msg = None
+    for msg in reversed(request.messages):
+        role = msg.role if hasattr(msg, "role") else msg.get("role")
+        if role == "user":
+            last_user_msg = msg
+            break
+    if last_user_msg is None:
+        return False
+    content = last_user_msg.content if hasattr(last_user_msg, "content") else last_user_msg.get("content")
+    if isinstance(content, list):
+        for block in content:
+            btype = (
+                block.get("type") if isinstance(block, dict)
+                else getattr(block, "type", None)
+            )
+            if btype == "image":
+                return True
     return False
 
 
