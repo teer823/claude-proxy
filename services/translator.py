@@ -598,28 +598,60 @@ def anthropic_to_openai_request(
                 blocks.append(b.model_dump() if hasattr(b, "model_dump") else vars(b))
 
         if xml_mode:
-            # Flatten everything to plain text for the upstream
-            parts: list[str] = []
+            # Flatten text/tool blocks to plain text for the upstream.
+            # Images cannot be represented as plain text, so they are preserved
+            # as image_url parts alongside the flattened text — the resulting
+            # ChatMessage uses a multipart content list when images are present.
+            text_parts_xml: list[str] = []
+            image_parts_xml: list[dict[str, Any]] = []
             for block in blocks:
                 btype = block.get("type")
                 if btype == "text":
-                    parts.append(block.get("text", ""))
+                    text_parts_xml.append(block.get("text", ""))
                 elif btype == "document":
                     source = block.get("source", {})
                     src_type = source.get("type", "")
                     if src_type == "text":
-                        parts.append(source.get("text", ""))
+                        text_parts_xml.append(source.get("text", ""))
                     elif src_type == "url":
-                        parts.append(f"[Attached document: {source.get('url', 'unknown')}]")
+                        text_parts_xml.append(f"[Attached document: {source.get('url', 'unknown')}]")
                     else:
                         media_type = source.get("media_type", "application/octet-stream")
                         title = block.get("title") or media_type
-                        parts.append(f"[Attached document: {title}]")
+                        text_parts_xml.append(f"[Attached document: {title}]")
+                elif btype == "image":
+                    source = block.get("source", {})
+                    src_type = source.get("type", "base64")
+                    if src_type == "base64":
+                        media_type = source.get("media_type", "image/jpeg")
+                        img_data = source.get("data", "")
+                        # RFC 2397 data URI — build the "" scheme prefix via
+                        # chr() so it survives markdown rendering of this source file.
+                        _data_scheme = chr(100)+chr(97)+chr(116)+chr(97)+chr(58)  # ""
+                        image_parts_xml.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"{_data_scheme}{media_type};base64,{img_data}"},
+                        })
+                    elif src_type == "url":
+                        image_parts_xml.append({
+                            "type": "image_url",
+                            "image_url": {"url": source.get("url", "")},
+                        })
                 elif btype == "tool_use":
-                    parts.append(_tool_use_block_to_xml(block))
+                    text_parts_xml.append(_tool_use_block_to_xml(block))
                 elif btype == "tool_result":
-                    parts.append(_tool_result_block_to_xml(block))
-            openai_messages.append(ChatMessage(role=role, content="\n".join(parts)))
+                    text_parts_xml.append(_tool_result_block_to_xml(block))
+
+            if image_parts_xml:
+                # Mixed: build multipart content list (text first, then images)
+                combined_text = "\n".join(text_parts_xml)
+                content_parts: list[dict[str, Any]] = []
+                if combined_text:
+                    content_parts.append({"type": "text", "text": combined_text})
+                content_parts.extend(image_parts_xml)
+                openai_messages.append(ChatMessage(role=role, content=content_parts))
+            else:
+                openai_messages.append(ChatMessage(role=role, content="\n".join(text_parts_xml)))
         else:
             has_tool_result = any(b.get("type") == "tool_result" for b in blocks)
             if has_tool_result and role == "user":
