@@ -13,6 +13,15 @@ from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 
+class UpstreamSSEError(Exception):
+    """Error event embedded in an otherwise successful upstream SSE response."""
+
+    def __init__(self, message: str, payload: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.message = message
+        self.payload = payload
+
+
 def _get_debug_log():
     """Return the debug logger if debug mode is active, else None."""
     try:
@@ -23,6 +32,20 @@ def _get_debug_log():
 
 # "" — built via chr() to survive markdown rendering
 _DATA_PREFIX = chr(100) + chr(97) + chr(116) + chr(97) + chr(58)  # d-a-t-a-:
+
+
+def _extract_sse_error(chunk: dict[str, Any]) -> str | None:
+    """Return a useful message when an SSE chunk contains an upstream error."""
+    error = chunk.get("error")
+    if not error:
+        return None
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("detail") or error.get("error")
+        if message:
+            return str(message)
+    return json.dumps(error, ensure_ascii=False)
 
 
 def _log_upstream_error(url: str, status_code: int, body: str) -> None:
@@ -207,8 +230,21 @@ async def stream_request(
                         continue
                     if debug_log and request_id:
                         chunks_for_log.append(chunk)
+
+                    error_message = _extract_sse_error(chunk)
+                    if error_message:
+                        logger.error(
+                            "%supstream SSE error | url=%s | message=%s",
+                            rid_tag,
+                            url,
+                            error_message,
+                        )
+                        raise UpstreamSSEError(error_message, chunk)
+
                     yield chunk
 
+        except UpstreamSSEError:
+            raise
         except httpx.TimeoutException as exc:
             logger.error(
                 "Streaming request to upstream timed out | url=%s | error_type=%s | detail=%s",

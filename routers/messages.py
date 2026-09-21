@@ -13,7 +13,13 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from schemas.anthropic import MessagesRequest
-from services.proxy import forward_request, stream_request, stream_to_completion, strip_thinking_segment
+from services.proxy import (
+    UpstreamSSEError,
+    forward_request,
+    stream_request,
+    stream_to_completion,
+    strip_thinking_segment,
+)
 from services.translator import (
     anthropic_to_openai_request,
     openai_stream_to_anthropic_events,
@@ -902,6 +908,22 @@ async def create_message(
                 read_timeout=settings.upstream_read_timeout,
                 request_id=rid,
             )
+        except UpstreamSSEError as exc:
+            elapsed = time.monotonic() - start_time
+            logger.error(
+                "[%s] ← 502 web_search upstream SSE failed: %s  duration=%.2fs",
+                rid, exc.message, elapsed,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"Upstream model service error: {exc.message}",
+                    },
+                },
+            )
         except Exception as exc:
             elapsed = time.monotonic() - start_time
             logger.error(
@@ -963,6 +985,20 @@ async def create_message(
                     except Exception:
                         pass
                     yield chunk_str
+            except UpstreamSSEError as exc:
+                elapsed = time.monotonic() - start_time
+                logger.error(
+                    "[%s] ← ERROR upstream SSE failed: %s  duration=%.2fs",
+                    rid, exc.message, elapsed,
+                )
+                error_event = {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"Upstream model service error: {exc.message}",
+                    },
+                }
+                yield _sse_event("error", error_event)
             except Exception as exc:
                 elapsed = time.monotonic() - start_time
                 logger.error(
@@ -998,6 +1034,22 @@ async def create_message(
             upstream_url, headers, payload,
             read_timeout=settings.upstream_read_timeout,
             request_id=rid,
+        )
+    except UpstreamSSEError as exc:
+        elapsed = time.monotonic() - start_time
+        logger.error(
+            "[%s] ← 502 upstream SSE failed: %s  duration=%.2fs",
+            rid, exc.message, elapsed,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": f"Upstream model service error: {exc.message}",
+                },
+            },
         )
     except Exception as exc:
         elapsed = time.monotonic() - start_time
