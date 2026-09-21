@@ -19,6 +19,96 @@ from schemas.openai import (
 
 
 # ---------------------------------------------------------------------------
+# XML marker constants
+# ---------------------------------------------------------------------------
+
+# Markers that signal the start of an embedded tool call in streamed text.
+# ``<invoke`` is included deliberately: some upstreams (observed on ICA-2
+# claude-opus-5) shred or omit the ``<function_calls>`` wrapper, leaving a bare
+# ``<invoke name="...">`` block that is still perfectly parseable.
+_XML_TOOL_MARKERS: tuple[str, ...] = (
+    "<function_calls>",
+    "<tool_use>",
+    "<tool_call>",
+    "<invoke",
+)
+
+_MAX_MARKER_LEN = max(len(m) for m in _XML_TOOL_MARKERS)
+
+# Markers that only ever appear in *conversation history* rendered by this proxy
+# (see ``_tool_result_block_to_xml``).  A model must never generate these: when
+# it does, it is fabricating tool output it never actually received.  Observed on
+# ICA-2, where the model pattern-completes the transcript and invents
+# "The file ... has been updated" result blocks.
+_HISTORY_LEAK_MARKERS: tuple[str, ...] = (
+    "<function_results>",
+    "</function_results>",
+    "<result>",
+    "</result>",
+)
+
+# Stop sequence that terminates a tool-call turn in XML mode.
+_XML_STOP_SEQUENCE = "</function_calls>"
+
+
+def _contains_tool_marker(text: str) -> bool:
+    """Return True if ``text`` contains any XML tool-call start marker."""
+    return any(m in text for m in _XML_TOOL_MARKERS)
+
+
+def _find_history_leak(text: str) -> Optional[str]:
+    """Return the first fabricated-history marker found in ``text``, if any."""
+    positions = [(text.find(m), m) for m in _HISTORY_LEAK_MARKERS]
+    found = [(p, m) for p, m in positions if p != -1]
+    if not found:
+        return None
+    return min(found)[1]
+
+
+def _strip_history_leak(text: str) -> str:
+    """Truncate ``text`` at the first fabricated-history marker.
+
+    The upstream has started inventing tool results; everything from that point
+    on is hallucinated and must not reach the client.
+    """
+    cut = len(text)
+    for m in _HISTORY_LEAK_MARKERS:
+        pos = text.find(m)
+        if pos != -1:
+            cut = min(cut, pos)
+    return text[:cut]
+
+
+def _is_marker_fragment(text: str) -> bool:
+    """Return True if ``text`` looks like a fragment of a tool-call marker.
+
+    Some upstreams lose the opening of ``<function_calls>`` and begin emitting
+    mid-marker (observed on ICA-2, which streamed ``"_"``, ``"cal"``, ``"ls>"``
+    with no leading ``<``).  Such fragments contain no ``<`` so the normal
+    hold-back cannot catch them, yet they must not be rendered as prose.
+
+    Only short, whitespace-free fragments qualify, so ordinary words are never
+    withheld.
+    """
+    probe = text.strip()
+    if not probe or len(probe) > _MAX_MARKER_LEN:
+        return False
+    if any(ch.isspace() for ch in probe):
+        return False
+    return any(probe in m for m in _XML_TOOL_MARKERS)
+
+
+# Matches an orphaned tail of "<function_calls>" left behind when the upstream
+# drops the opening of the marker, e.g. "_calls>", "calls>", "ls>".
+_ORPHAN_WRAPPER_RE = re.compile(r"^\s*[a-z_]*calls?>\s*", re.IGNORECASE)
+
+
+def _strip_orphan_wrapper_fragment(text: str) -> str:
+    """Remove a leading orphaned ``<function_calls>`` tail from ``text``."""
+    return _ORPHAN_WRAPPER_RE.sub("", text, count=1)
+
+
+# ---------------------------------------------------------------------------
 # XML tool-call parser
 # ---------------------------------------------------------------------------
 
@@ -333,7 +423,14 @@ def tools_to_system_prompt(tools: list[Any]) -> str:
 
 
 def _tools_to_system_prompt(tools: list[Any]) -> str:
-    """Render tool definitions as a system-prompt block for XML-mode upstreams."""
+    """Render tool definitions as a system-prompt block for XML-mode upstreams.
+
+    The explicit rules below exist because some upstreams (observed on ICA-2
+    claude-opus-5) continue generating past their own ``</function_calls>`` and
+    fabricate ``<function_results>``/``<result>`` blocks describing tool output
+    they never received.  Stating that results are system-supplied — and that the
+    turn ends at ``</function_calls>`` — suppresses that behaviour.
+    """
     lines = [
         "You have access to the following tools. To call a tool, respond with XML in this format:",
         "",
@@ -342,6 +439,16 @@ def _tools_to_system_prompt(tools: list[Any]) -> str:
         '    <parameter name="PARAM_NAME">value</parameter>',
         "  </invoke>",
         "</function_calls>",
+        "",
+        "CRITICAL RULES for tool calls:",
+        "1. After you emit the closing </function_calls> tag, STOP generating immediately. "
+        "End your turn. Do not write anything after it.",
+        "2. NEVER write <function_results>, <result>, or </result> tags yourself. "
+        "Tool results are executed and supplied to you by the system in the NEXT message. "
+        "Inventing them is a critical error.",
+        "3. NEVER describe or claim the outcome of a tool call (e.g. \"the file has been "
+        "updated\") in the same turn that requests it. You have not seen the result yet.",
+        "4. Wait for the real <function_results> from the system before continuing.",
         "",
         "Available tools:",
     ]
@@ -541,6 +648,7 @@ def anthropic_to_openai_request(
     request: MessagesRequest,
     target_model: str,
     force_xml_tools: bool = False,
+    xml_stop_sequence: bool = False,
 ) -> ChatCompletionRequest:
     """Convert an Anthropic MessagesRequest to an OpenAI ChatCompletionRequest.
 
@@ -555,6 +663,13 @@ def anthropic_to_openai_request(
     for upstreams that silently strip the native ``tools`` parameter (IBM ICA
     does — the model never sees the definitions, so the first tool call can
     never happen and the conversation-content heuristic never triggers).
+
+    ``xml_stop_sequence`` appends ``</function_calls>`` to the upstream ``stop``
+    list while in XML mode.  This is a hard guarantee that the model cannot keep
+    generating past its own tool call and fabricate ``<result>`` blocks.  It is
+    opt-in per backend because well-behaved upstreams (ICA-1) do not need it and
+    a stop sequence can truncate turns that legitimately batch several
+    ``<invoke>`` blocks inside one wrapper.
     """
     xml_mode = force_xml_tools or _is_xml_mode(request)
 
@@ -772,6 +887,22 @@ def anthropic_to_openai_request(
             target_model,
         )
 
+    # Stop sequences: pass the client's through unchanged, and — only when the
+    # backend opts in — append the XML tool-call terminator so the upstream
+    # physically cannot continue into fabricated tool results.
+    stop_sequences: Optional[list[str]] = (
+        list(request.stop_sequences) if request.stop_sequences else None
+    )
+    if xml_mode and xml_stop_sequence:
+        stop_sequences = stop_sequences or []
+        if _XML_STOP_SEQUENCE not in stop_sequences:
+            stop_sequences.append(_XML_STOP_SEQUENCE)
+        _logger.debug(
+            "XML mode: injected %r stop sequence (stop=%r)",
+            _XML_STOP_SEQUENCE,
+            stop_sequences,
+        )
+
     return ChatCompletionRequest(
         model=target_model,
         messages=openai_messages,
@@ -779,7 +910,7 @@ def anthropic_to_openai_request(
         max_completion_tokens=max_tokens if uses_max_completion_tokens else None,
         temperature=request.temperature,
         top_p=request.top_p,
-        stop=request.stop_sequences,
+        stop=stop_sequences,
         stream=request.stream,
         # Ask streaming upstreams to emit a final usage chunk so real token
         # counts can be reported to the client; ignored by upstreams that
@@ -847,8 +978,35 @@ def openai_to_anthropic_response(
                     if remaining_text3:
                         content_blocks.append({"type": "text", "text": remaining_text3})
                     content_blocks.extend(tc_tool_blocks)
+                elif "<invoke" in text_content:
+                    # Bare <invoke> with no <function_calls> wrapper (ICA-2).
+                    bare_src = _strip_history_leak(text_content)
+                    start = bare_src.find("<invoke")
+                    bare_blocks = _parse_xml_tool_calls_regex(bare_src[start:])
+                    if bare_blocks:
+                        _logger.warning(
+                            "Recovered %d bare <invoke> tool call(s) with no "
+                            "<function_calls> wrapper from upstream response.",
+                            len(bare_blocks),
+                        )
+                        preamble = bare_src[:start].rstrip()
+                        if preamble:
+                            content_blocks.append({"type": "text", "text": preamble})
+                        content_blocks.extend(bare_blocks)
+                    else:
+                        content_blocks.append({"type": "text", "text": bare_src})
                 else:
-                    content_blocks.append({"type": "text", "text": text_content})
+                    # Never surface fabricated tool-result markers to the client.
+                    leak = _find_history_leak(text_content)
+                    if leak is not None:
+                        _logger.warning(
+                            "Upstream generated fabricated tool-result marker %r in "
+                            "response text; truncating.",
+                            leak,
+                        )
+                        text_content = _strip_history_leak(text_content)
+                    if text_content:
+                        content_blocks.append({"type": "text", "text": text_content})
 
     # Structured tool calls from the OpenAI response
     tool_calls = message.get("tool_calls") or []
@@ -975,44 +1133,90 @@ def openai_stream_to_anthropic_events(
     delta = choice.get("delta", {})
     finish_reason = choice.get("finish_reason")
 
+    # Latch: once the upstream starts fabricating tool results, everything it
+    # emits for the rest of the turn is hallucinated.  Stored in usage_data
+    # because that dict is the only state threaded across chunk calls; it is
+    # popped before the final message_delta is serialized.
+    history_leaked = bool(usage_data.get("_history_leak"))
+
     text_delta = delta.get("content")
+    if text_delta and history_leaked:
+        # Suppress all further text after a fabricated tool result.
+        text_delta = None
+        accumulated_text = ""
+
     if text_delta:
         accumulated_text += text_delta
         # Once a full XML marker is detected we stop streaming and buffer
         # everything until finish_reason so the whole block can be parsed.
-        if "<function_calls>" not in accumulated_text and "<tool_use>" not in accumulated_text and "<tool_call>" not in accumulated_text:
-            # Guard against XML markers split across chunk boundaries by
-            # retaining a tail that could still be a partial prefix of either
-            # marker.  Only the "safe" prefix (everything before that tail) is
-            # flushed immediately.
-            xml_markers = ["<function_calls>", "<tool_use>", "<tool_call>"]
-            max_marker_len = max(len(m) for m in xml_markers)
-
-            # Find the longest suffix of accumulated_text that is a prefix of
-            # any XML marker we care about.
+        if not _contains_tool_marker(accumulated_text):
+            # Guard against XML markers split across chunk boundaries.
+            #
+            # The previous implementation only held back a tail that was a clean
+            # suffix/prefix of a *complete* marker, which fails when an upstream
+            # shreds a marker across three or more chunks (observed on ICA-2:
+            # "_", "cal", "ls>", "\n<inv", ...).  Each fragment was flushed as
+            # plain text, so "<function_calls>" could never be reconstructed and
+            # raw XML leaked to the client.
+            #
+            # Instead, hold back from the last unclosed "<" onward whenever the
+            # text after it is still a viable prefix of any marker.  This is
+            # robust to a marker split across an arbitrary number of chunks.
             safe_text = accumulated_text
             hold_back = ""
-            tail_len = min(len(accumulated_text), max_marker_len - 1)
-            for tail_size in range(tail_len, 0, -1):
-                tail = accumulated_text[-tail_size:]
-                if any(m.startswith(tail) for m in xml_markers):
-                    safe_text = accumulated_text[:-tail_size]
-                    hold_back = tail
-                    break
+
+            if _is_marker_fragment(accumulated_text):
+                # The whole buffer is a partial marker — possibly one that lost
+                # its leading "<" upstream (e.g. "_", "cal", "ls>").  Hold it all
+                # back so fragments are never rendered as prose.
+                safe_text = ""
+                hold_back = accumulated_text
+            else:
+                lt_pos = accumulated_text.rfind("<")
+                if lt_pos != -1:
+                    candidate = accumulated_text[lt_pos:]
+                    # Only hold back while the fragment could still become a marker.
+                    # Cap the hold-back so ordinary prose containing "<" (e.g. "a < b")
+                    # cannot stall the stream indefinitely.
+                    if len(candidate) <= _MAX_MARKER_LEN and any(
+                        m.startswith(candidate) or candidate.startswith(m)
+                        for m in _XML_TOOL_MARKERS
+                    ):
+                        safe_text = accumulated_text[:lt_pos]
+                        hold_back = candidate
 
             if safe_text:
-                if not sent_content_block_start.get(block_index):
+                # Drop an orphaned "<function_calls>" tail (e.g. "_calls>") that
+                # the upstream emitted after losing the start of the marker.
+                safe_text = _strip_orphan_wrapper_fragment(safe_text)
+
+            if safe_text:
+                # Fabricated tool-result markers must never reach the client.
+                leak = _find_history_leak(safe_text)
+                if leak is not None:
+                    _logger.warning(
+                        "Upstream generated fabricated tool-result marker %r in streamed "
+                        "text; truncating. This indicates the model is inventing tool "
+                        "output it never received.",
+                        leak,
+                    )
+                    safe_text = _strip_history_leak(safe_text)
+                    usage_data["_history_leak"] = True
+                    hold_back = ""
+
+                if safe_text:
+                    if not sent_content_block_start.get(block_index):
+                        events.append({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                        sent_content_block_start[block_index] = True
                     events.append({
-                        "type": "content_block_start",
+                        "type": "content_block_delta",
                         "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
+                        "delta": {"type": "text_delta", "text": safe_text},
                     })
-                    sent_content_block_start[block_index] = True
-                events.append({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "text_delta", "text": safe_text},
-                })
             accumulated_text = hold_back
 
     tool_calls_delta = delta.get("tool_calls") or []
@@ -1056,20 +1260,35 @@ def openai_stream_to_anthropic_events(
 
     if finish_reason:
         # Flush any held-back text that turned out not to be an XML marker
-        if accumulated_text and "<function_calls>" not in accumulated_text and "<tool_use>" not in accumulated_text and "<tool_call>" not in accumulated_text:
-            if not sent_content_block_start.get(block_index):
-                events.append({
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "text", "text": ""},
-                })
-                sent_content_block_start[block_index] = True
-            events.append({
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "text_delta", "text": accumulated_text},
-            })
+        if accumulated_text and not _contains_tool_marker(accumulated_text):
+            flush_text = accumulated_text
+            leak = _find_history_leak(flush_text)
+            if leak is not None:
+                _logger.warning(
+                    "Upstream generated fabricated tool-result marker %r at end of "
+                    "stream; truncating.",
+                    leak,
+                )
+                flush_text = _strip_history_leak(flush_text)
+            # A leftover marker fragment is not real prose — drop it rather than
+            # rendering "_calls>" or "<inv" at the end of the turn.
+            if _is_marker_fragment(flush_text):
+                flush_text = ""
+            flush_text = _strip_orphan_wrapper_fragment(flush_text)
             accumulated_text = ""
+            if flush_text:
+                if not sent_content_block_start.get(block_index):
+                    events.append({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    })
+                    sent_content_block_start[block_index] = True
+                events.append({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": flush_text},
+                })
 
         # Try <function_calls> XML format
         if accumulated_text and "<function_calls>" in accumulated_text:
@@ -1194,6 +1413,73 @@ def openai_stream_to_anthropic_events(
                     })
                 finish_reason = "tool_calls"
 
+        # Recovery path: a bare <invoke> block with no <function_calls> wrapper.
+        # Observed on ICA-2, where the wrapper is sometimes omitted entirely or
+        # lost upstream.  The regex parser handles these fine, so recover them as
+        # real tool_use blocks instead of leaking raw XML to the client.
+        elif accumulated_text and "<invoke" in accumulated_text:
+            bare_src = _strip_history_leak(accumulated_text)
+            start = bare_src.find("<invoke")
+            preamble = bare_src[:start].rstrip()
+            bare_blocks = _parse_xml_tool_calls_regex(bare_src[start:])
+            accumulated_text = ""
+            if bare_blocks:
+                _logger.warning(
+                    "Recovered %d bare <invoke> tool call(s) with no <function_calls> "
+                    "wrapper from upstream text.",
+                    len(bare_blocks),
+                )
+                if preamble:
+                    if not sent_content_block_start.get(block_index):
+                        events.append({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                        sent_content_block_start[block_index] = True
+                    events.append({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": preamble},
+                    })
+                for i, bare_tc in enumerate(bare_blocks):
+                    tb_idx = (block_index + 1 + i) if sent_content_block_start.get(block_index) else (block_index + i)
+                    events.append({
+                        "type": "content_block_start",
+                        "index": tb_idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": bare_tc["id"],
+                            "name": bare_tc["name"],
+                            "input": {},
+                        },
+                    })
+                    sent_content_block_start[tb_idx] = True
+                    events.append({
+                        "type": "content_block_delta",
+                        "index": tb_idx,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(bare_tc["input"], ensure_ascii=False),
+                        },
+                    })
+                finish_reason = "tool_calls"
+            else:
+                # Unparseable — emit as text rather than silently dropping it.
+                if preamble or bare_src:
+                    if not sent_content_block_start.get(block_index):
+                        events.append({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                        sent_content_block_start[block_index] = True
+                    events.append({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": bare_src},
+                    })
+
         for idx in sorted(sent_content_block_start.keys()):
             events.append({"type": "content_block_stop", "index": idx})
 
@@ -1204,6 +1490,7 @@ def openai_stream_to_anthropic_events(
         # Streamed output size comes from the private running counter (plus
         # any text flushed in this final call) — accumulated_text can't be
         # used because the XML-detection paths reset it mid-stream.
+        usage_data.pop("_history_leak", None)
         streamed_chars = usage_data.pop("_streamed_chars", 0) + _count_text_delta_chars(events)
         if not usage_data.get("input_tokens") and not usage_data.get("output_tokens"):
             usage_data["input_tokens"] = input_tokens_estimate

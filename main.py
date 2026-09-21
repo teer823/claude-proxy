@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     # parameter — the model never sees tool definitions, so native calls can
     # never happen. Set false for upstreams with working native tool support.
     force_xml_tools: bool = True
+    # Backends that receive the "</function_calls>" stop sequence in XML mode.
+    # Some upstreams (ICA-2 claude-opus-5) keep generating past their own tool
+    # call and fabricate <result> blocks describing output they never received;
+    # a hard stop sequence prevents that. ICA-1 is well behaved and is therefore
+    # left untouched by default, since a stop sequence can truncate turns that
+    # legitimately batch several <invoke> blocks in one wrapper.
+    # Comma-separated list of backend ids ("ica1", "ica2"); empty disables.
+    xml_stop_sequence_backends: str = "ica2"
     # Web search tool settings
     web_search_provider: str = "duckduckgo"  # "duckduckgo" or "tavily"
     tavily_api_key: str = ""

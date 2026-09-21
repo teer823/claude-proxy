@@ -201,6 +201,29 @@ def _resolve_backend(
     )
 
 
+def _backend_id_for_url(upstream_url: str, settings: Any) -> str:
+    """Return the backend id ("ica1"/"ica2") that ``upstream_url`` belongs to.
+
+    Derived from the URL rather than returned by ``_resolve_backend`` so that
+    function's signature (and its existing callers/tests) stay unchanged.
+    """
+    ica2_base = (settings.ica2_base_url or "").rstrip("/")
+    if ica2_base and upstream_url.startswith(ica2_base):
+        return "ica2"
+    return "ica1"
+
+
+def _xml_stop_sequence_enabled(backend_id: str, settings: Any) -> bool:
+    """Return whether the XML stop sequence should be sent to ``backend_id``.
+
+    Scoped per backend: ICA-2 needs it (its models fabricate tool results), while
+    ICA-1 is well behaved and is left byte-identical to previous behaviour.
+    """
+    raw = getattr(settings, "xml_stop_sequence_backends", "") or ""
+    enabled = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    return backend_id in enabled
+
+
 # "" prefix built via chr() to survive markdown rendering of this source file.
 _SSE_DATA_PREFIX = chr(100) + chr(97) + chr(116) + chr(97) + chr(58)  # d-a-t-a-:
 
@@ -616,6 +639,7 @@ async def _run_web_search_agentic_loop(
     tavily_api_key: str,
     read_timeout: float = 300.0,
     request_id: str | None = None,
+    xml_stop_sequence: bool = False,
 ) -> dict[str, Any]:
     """Execute the agentic tool-call loop for web_search.
 
@@ -642,7 +666,9 @@ async def _run_web_search_agentic_loop(
         req_data["tool_choice"] = None
 
         iter_request = MessagesRequest(**req_data)
-        openai_req = anthropic_to_openai_request(iter_request, target_model)
+        openai_req = anthropic_to_openai_request(
+            iter_request, target_model, xml_stop_sequence=xml_stop_sequence
+        )
         payload = openai_req.model_dump(exclude_none=True)
         payload["stream"] = False
 
@@ -944,6 +970,9 @@ async def create_message(
         request.tools and any(_is_web_search_tool(t) for t in request.tools)
     )
 
+    backend_id = _backend_id_for_url(upstream_url, settings)
+    use_xml_stop = _xml_stop_sequence_enabled(backend_id, settings)
+
     # --- Web-search agentic loop path ---
     if has_web_search:
         try:
@@ -956,6 +985,7 @@ async def create_message(
                 tavily_api_key=settings.tavily_api_key,
                 read_timeout=settings.upstream_read_timeout,
                 request_id=rid,
+                xml_stop_sequence=use_xml_stop,
             )
         except UpstreamSSEError as exc:
             elapsed = time.monotonic() - start_time
@@ -1006,7 +1036,10 @@ async def create_message(
 
     # --- Standard proxy path ---
     openai_request = anthropic_to_openai_request(
-        request, target_model, force_xml_tools=settings.force_xml_tools
+        request,
+        target_model,
+        force_xml_tools=settings.force_xml_tools,
+        xml_stop_sequence=use_xml_stop,
     )
     payload = openai_request.model_dump(exclude_none=True)
 
