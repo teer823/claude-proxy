@@ -531,6 +531,12 @@ def _build_tool_result_content(block: Any) -> str:
 # Anthropic -> OpenAI request translation
 # ---------------------------------------------------------------------------
 
+def _uses_max_completion_tokens(model: str) -> bool:
+    """Return whether ``model`` requires OpenAI's newer token-limit field."""
+    model_name = model.rsplit("/", 1)[-1].lower()
+    return model_name.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
 def anthropic_to_openai_request(
     request: MessagesRequest,
     target_model: str,
@@ -759,10 +765,18 @@ def anthropic_to_openai_request(
             )
             max_tokens = new_max
 
+    uses_max_completion_tokens = _uses_max_completion_tokens(target_model)
+    if uses_max_completion_tokens:
+        _logger.debug(
+            "model=%r requires max_completion_tokens; omitting max_tokens",
+            target_model,
+        )
+
     return ChatCompletionRequest(
         model=target_model,
         messages=openai_messages,
-        max_tokens=max_tokens,
+        max_tokens=None if uses_max_completion_tokens else max_tokens,
+        max_completion_tokens=max_tokens if uses_max_completion_tokens else None,
         temperature=request.temperature,
         top_p=request.top_p,
         stop=request.stop_sequences,

@@ -108,6 +108,34 @@ def _load_routing_table(settings: Any) -> dict[str, Any]:
         return {}
 
 
+def _apply_forced_model(settings: Any, backend: str, resolved_model: str) -> str:
+    """Return the emergency override model for ``backend`` when enabled.
+
+    Empty backend-specific values intentionally fall back to the normally
+    resolved model so enabling the flag cannot send an empty model upstream.
+    """
+    if not getattr(settings, "force_model_override", False):
+        return resolved_model
+
+    setting_name = f"{backend}_force_model"
+    forced_model = getattr(settings, setting_name, "").strip()
+    if not forced_model:
+        logger.warning(
+            "FORCE_MODEL_OVERRIDE is enabled but %s is empty; using resolved model=%r",
+            setting_name.upper(),
+            resolved_model,
+        )
+        return resolved_model
+
+    logger.info(
+        "Force model override enabled: backend=%s resolved_model=%r forced_model=%r",
+        backend,
+        resolved_model,
+        forced_model,
+    )
+    return forced_model
+
+
 def _resolve_backend(
     client_model: str,
     settings: Any,
@@ -135,7 +163,11 @@ def _resolve_backend(
                 logger.debug(
                     "Routing model=%r → ica2 upstream_model=%r", client_model, resolved_model
                 )
-                return url, _build_upstream_headers(settings.ica2_api_key), resolved_model
+                return (
+                    url,
+                    _build_upstream_headers(settings.ica2_api_key),
+                    _apply_forced_model(settings, "ica2", resolved_model),
+                )
             # ICA-2 requested but not configured → failover to ICA-1 default model
             logger.warning(
                 "Routing model=%r requested ica2 backend but ICA2_BASE_URL is not configured "
@@ -144,17 +176,29 @@ def _resolve_backend(
                 settings.default_model,
             )
             url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
-            return url, _build_upstream_headers(settings.openai_api_key), settings.default_model
+            return (
+                url,
+                _build_upstream_headers(settings.openai_api_key),
+                _apply_forced_model(settings, "ica1", settings.default_model),
+            )
         # backend == "ica1"
         url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
         logger.debug(
             "Routing model=%r → ica1 upstream_model=%r", client_model, resolved_model
         )
-        return url, _build_upstream_headers(settings.openai_api_key), resolved_model
+        return (
+            url,
+            _build_upstream_headers(settings.openai_api_key),
+            _apply_forced_model(settings, "ica1", resolved_model),
+        )
 
     # Not in routing table → ICA-1 default
     url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
-    return url, _build_upstream_headers(settings.openai_api_key), settings.default_model
+    return (
+        url,
+        _build_upstream_headers(settings.openai_api_key),
+        _apply_forced_model(settings, "ica1", settings.default_model),
+    )
 
 
 # "" prefix built via chr() to survive markdown rendering of this source file.
@@ -567,6 +611,7 @@ async def _run_web_search_agentic_loop(
     request: MessagesRequest,
     upstream_url: str,
     headers: dict[str, str],
+    target_model: str,
     provider: str,
     tavily_api_key: str,
     read_timeout: float = 300.0,
@@ -597,7 +642,7 @@ async def _run_web_search_agentic_loop(
         req_data["tool_choice"] = None
 
         iter_request = MessagesRequest(**req_data)
-        openai_req = anthropic_to_openai_request(iter_request, _get_settings().default_model)
+        openai_req = anthropic_to_openai_request(iter_request, target_model)
         payload = openai_req.model_dump(exclude_none=True)
         payload["stream"] = False
 
@@ -866,10 +911,13 @@ async def create_message(
         if settings.ica2_base_url:
             upstream_url = f"{settings.ica2_base_url.rstrip('/')}/chat/completions"
             headers = _build_upstream_headers(settings.ica2_api_key)
-            target_model = "claude-sonnet-4-6"
+            target_model = _apply_forced_model(
+                settings, "ica2", "claude-sonnet-4-6"
+            )
             logger.info(
-                "[%s] image detected → overriding backend to ica2 model=claude-sonnet-4-6",
+                "[%s] image detected → overriding backend to ica2 model=%s",
                 rid,
+                target_model,
             )
         else:
             # ICA-2 not configured — fall back to ICA-1 default model
@@ -903,6 +951,7 @@ async def create_message(
                 request=request,
                 upstream_url=upstream_url,
                 headers=headers,
+                target_model=target_model,
                 provider=settings.web_search_provider,
                 tavily_api_key=settings.tavily_api_key,
                 read_timeout=settings.upstream_read_timeout,

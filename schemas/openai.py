@@ -42,6 +42,9 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     max_tokens: Optional[int] = None
+    # Newer OpenAI reasoning models (GPT-5 and o-series) reject max_tokens
+    # and require this replacement parameter instead.
+    max_completion_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     stop: Optional[Union[str, list[str]]] = None

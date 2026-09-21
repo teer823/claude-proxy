@@ -13,6 +13,7 @@ This lets you point **Claude Code** (or any Anthropic-compatible client) at your
 - Filters leaked extended-thinking segments out of ICA streaming responses
 - Token usage reporting (real upstream numbers when available, chars/4 estimates otherwise) + `POST /v1/messages/count_tokens`
 - **`SMALL_MODEL` routing** — haiku-class background requests (conversation titles etc.) go to a cheaper model
+- GPT-5 and OpenAI o-series compatibility — automatically uses `max_completion_tokens` instead of unsupported `max_tokens`
 - Errors returned in Anthropic format so clients show readable messages and retry correctly
 - Debug logging mode with daily-rotating log files
 - Runs on **port 8082**
@@ -83,8 +84,13 @@ OPENAI_BASE_URL=https://sg.ica.ibm.com/ica/apis/v3
 # Bearer token / API key for the upstream
 OPENAI_API_KEY=your-api-key-here
 
-# Model name sent to the upstream (overrides whatever the client requests)
+# Default ICA-1 model used when no routing entry matches
 DEFAULT_MODEL=global/anthropic.claude-sonnet-4-6
+
+# Optional emergency override; routing still chooses the backend normally
+FORCE_MODEL_OVERRIDE=false
+ICA1_FORCE_MODEL=global/anthropic.claude-sonnet-4-6
+ICA2_FORCE_MODEL=claude-sonnet-4-6
 
 # Web search provider: "duckduckgo" (no key required) or "tavily"
 WEB_SEARCH_PROVIDER=duckduckgo
@@ -326,6 +332,9 @@ Create or edit `.claude/settings.json` in your home directory or project root:
 | `OPENAI_API_KEY` | *(required)* | Bearer token for the upstream |
 | `DEFAULT_MODEL` | `global/anthropic.claude-sonnet-4-6` | Model name sent to upstream; overrides the client's requested model |
 | `SMALL_MODEL` | *(empty)* | Optional cheaper model for haiku-class background requests (e.g. `global/anthropic.claude-haiku-4-5-20251001-v1:0`); empty = everything uses `DEFAULT_MODEL` |
+| `FORCE_MODEL_OVERRIDE` | `false` | Emergency switch that replaces the resolved model with the selected backend's force model without changing backend routing |
+| `ICA1_FORCE_MODEL` | *(empty)* | Model used for ICA-1 while `FORCE_MODEL_OVERRIDE=true`; empty safely falls back to normal routing |
+| `ICA2_FORCE_MODEL` | *(empty)* | Model used for ICA-2 while `FORCE_MODEL_OVERRIDE=true`; empty safely falls back to normal routing |
 | `FORCE_XML_TOOLS` | `true` | Inject tool definitions as XML in the system prompt (required for IBM ICA, which strips the native `tools` param). Set `false` for upstreams with working native function calling |
 | `WEB_SEARCH_PROVIDER` | `duckduckgo` | `duckduckgo` (no key needed) or `tavily` |
 | `TAVILY_API_KEY` | *(empty)* | Required when `WEB_SEARCH_PROVIDER=tavily` |

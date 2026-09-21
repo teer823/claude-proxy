@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # ICA-2 backend (optional second upstream with limited tokens)
     ica2_base_url: str = ""       # empty = ICA-2 disabled
     ica2_api_key: str = ""
+    # Emergency model override. Backend selection still follows normal routing,
+    # but the selected backend always receives its configured force model.
+    force_model_override: bool = False
+    ica1_force_model: str = ""
+    ica2_force_model: str = ""
     # Path to the JSON file containing the model routing table.
     # The file maps client model ids to {backend, model} entries.
     # Default: model_routing.json in the current working directory.
