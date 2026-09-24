@@ -13,5 +13,6 @@
   "global/anthropic.claude-haiku-4-5-20251001-v1:0": {"backend": "ica1", "model": "global/anthropic.claude-haiku-4-5-20251001-v1:0"},
   "claude-sonnet-5":    {"backend": "ica2", "model": "claude-sonnet-5"},
   "claude-opus-4-8":    {"backend": "ica2", "model": "claude-opus-4-8"},
-  "claude-opus-5":      {"backend": "ica2", "model": "claude-opus-5"}
+  "claude-opus-5":      {"backend": "ica2", "model": "claude-opus-5"},
+  "claude-opus-5-5":    {"backend": "ica2", "model": "claude-opus-5-5"}
 }
