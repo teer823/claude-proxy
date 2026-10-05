@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     upstream_read_timeout: float = 300.0  # seconds to wait for upstream to respond/stream
     # Proxy authentication (for non-localhost access, e.g. via ngrok)
     proxy_api_key: str = ""  # when set, non-localhost requests must supply this key
+    # Escape hatch: skip API-key enforcement entirely even when PROXY_API_KEY is set.
+    # Useful in containers, where host "localhost" calls arrive from the bridge IP
+    # and therefore look like external clients.
+    disable_proxy_api_key: bool = False
     # Debug logging
     debug_mode: bool = False  # set DEBUG_MODE=true to enable request/response file logging
     debug_log_dir: str = "logs"  # directory where daily debug logs are written
@@ -363,7 +367,9 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-if settings.proxy_api_key:
+if settings.proxy_api_key and settings.disable_proxy_api_key:
+    logger.info("ApiKeyMiddleware disabled — DISABLE_PROXY_API_KEY=true (PROXY_API_KEY ignored).")
+elif settings.proxy_api_key:
     app.add_middleware(ApiKeyMiddleware)
     logger.info("ApiKeyMiddleware registered — non-localhost requests require a valid API key.")
 else:
