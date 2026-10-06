@@ -971,6 +971,7 @@ async def create_message(
     )
 
     backend_id = _backend_id_for_url(upstream_url, settings)
+    logger.info("[%s] → backend=%s model=%s", rid, backend_id.upper(), target_model)
     use_xml_stop = _xml_stop_sequence_enabled(backend_id, settings)
 
     # --- Web-search agentic loop path ---
