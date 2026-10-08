@@ -198,18 +198,30 @@ bash start_proxy.sh
 Or run it manually:
 
 ```bash
+mkdir -p logs
 podman run -d \
   --name claude-proxy \
   --env-file .env \
+  -e DEBUG_LOG_DIR=/app/logs \
+  -v "$(pwd)/logs:/app/logs" \
+  -v "$(pwd)/model_routing.json:/app/model_routing.json:ro" \
+  --userns=keep-id:uid=1000,gid=1000 \
   -p 8082:8082 \
   --restart unless-stopped \
   claude-proxy:latest
 ```
 
+The project's `logs/` folder is mounted into the container at `/app/logs`, so
+`proxy.log` (and the debug logs when `DEBUG_MODE=true`) persist on the host
+across container restarts. `--userns=keep-id` maps your host user to the
+container's `appuser` so it can write to the folder.
+
 ### View logs
 
 ```bash
 podman logs -f claude-proxy
+# or read the log files directly
+tail -f logs/proxy.log
 ```
 
 ### Stop the container
@@ -226,9 +238,13 @@ bash stop.sh
 docker build -t claude-proxy .
 
 # Start
+New-Item -ItemType Directory -Force -Path logs | Out-Null
 docker run -d `
   --name claude-proxy `
   --env-file .env `
+  -e DEBUG_LOG_DIR=/app/logs `
+  -v "${PWD}\logs:/app/logs" `
+  -v "${PWD}\model_routing.json:/app/model_routing.json:ro" `
   -p 8082:8082 `
   --restart unless-stopped `
   claude-proxy:latest

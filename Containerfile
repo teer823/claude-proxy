@@ -14,6 +14,9 @@ COPY main.py .
 COPY routers/ routers/
 COPY schemas/ schemas/
 COPY services/ services/
+# Model routing table (start_proxy.sh/.ps1 also bind-mount the host copy over
+# this so routing can be edited without rebuilding the image).
+COPY model_routing.json .
 
 # main.py always writes an application log file under DEBUG_LOG_DIR (default
 # "logs"), even when DEBUG_MODE=false, so appuser needs write access to /app.
